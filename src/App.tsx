@@ -17,6 +17,7 @@ import type {
   GoogleCalendarEventOverlay,
   MainTab,
   Priority,
+  RepeatRule,
   StudyDatabase,
   StudySession,
   SyncStatusInfo,
@@ -29,7 +30,8 @@ import {
   getWeekStart,
   toLocalDateKey,
 } from './utils/dateUtils';
-import { createEmptyDatabase, createInitialDatabase } from './utils/seedData';
+import { computeNextDueDate, normalizeRepeatRule } from './utils/recurrence';
+import { createEmptyDatabase } from './utils/seedData';
 import { playCompletionChime } from './utils/sound';
 import {
   clearAccessToken,
@@ -38,6 +40,7 @@ import {
   getAccessToken,
   getSavedClientId,
   hasValidAccessToken,
+  overwriteDriveSyncFile,
   parseOAuthCallbackFromHash,
   performFullGoogleSync,
   redirectToGoogleOAuth,
@@ -68,9 +71,9 @@ function loadDatabase(): StudyDatabase {
       }
     }
   } catch {
-    // Fallback to initial seed
+    // Fallback to empty database
   }
-  return createInitialDatabase();
+  return createEmptyDatabase();
 }
 
 function loadInitialTimer(db: StudyDatabase): ActiveTimerSnapshot {
@@ -78,8 +81,11 @@ function loadInitialTimer(db: StudyDatabase): ActiveTimerSnapshot {
     const raw = localStorage.getItem(TIMER_STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as ActiveTimerSnapshot;
-      if (parsed && parsed.mode && parsed.subjectId) {
-        return parsed;
+      if (parsed && parsed.mode) {
+        return {
+          ...parsed,
+          subjectId: parsed.subjectId || '',
+        };
       }
     }
   } catch {
@@ -93,8 +99,8 @@ function loadInitialTimer(db: StudyDatabase): ActiveTimerSnapshot {
     startedAtMs: null,
     accumulatedMs: 0,
     targetDurationMs: 25 * 60 * 1000,
-    subjectId: firstSubj?.id || 'subj-general',
-    title: `${firstSubj?.name || 'Study'} Deep Focus`,
+    subjectId: firstSubj?.id || '',
+    title: firstSubj ? `${firstSubj.name} Deep Focus` : 'Focus Session',
   };
 }
 
@@ -523,9 +529,11 @@ export default function App() {
     priority: Priority;
     due?: string;
     notes?: string;
+    repeat?: RepeatRule;
   }) => {
     const id = `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const nowIso = new Date().toISOString();
+    const cleanRepeat = normalizeRepeatRule(input.repeat);
     mutateDb((prev) => ({
       ...prev,
       tasks_metadata: {
@@ -540,6 +548,7 @@ export default function App() {
           estimated_minutes: input.estimatedMinutes,
           logged_minutes: 0,
           priority: input.priority,
+          repeat: cleanRepeat,
           updatedAt: nowIso,
         },
       },
@@ -547,21 +556,69 @@ export default function App() {
   };
 
   const handleUpdateTask = (taskId: string, patch: Partial<TaskMetadata>) => {
+    const currentTask = dbRef.current.tasks_metadata[taskId];
+    const hasRepeatPatch = Object.prototype.hasOwnProperty.call(patch, 'repeat');
+    const targetRepeat = normalizeRepeatRule(
+      hasRepeatPatch ? patch.repeat : currentTask?.repeat
+    );
+    const willRollForward =
+      !!currentTask &&
+      patch.status === 'completed' &&
+      currentTask.status !== 'completed' &&
+      !!targetRepeat &&
+      !currentTask.nextOccurrenceSpawned;
+
     mutateDb((prev) => {
       const existing = prev.tasks_metadata[taskId];
       if (!existing) return prev;
+
+      const nowIso = new Date().toISOString();
+      const effectiveRepeat = normalizeRepeatRule(
+        hasRepeatPatch ? patch.repeat : existing.repeat
+      );
+      const isCompletingNow =
+        patch.status === 'completed' && existing.status !== 'completed';
+      const shouldSpawnNext =
+        isCompletingNow && !!effectiveRepeat && !existing.nextOccurrenceSpawned;
+
+      const updatedExisting: TaskMetadata = {
+        ...existing,
+        ...patch,
+        repeat: effectiveRepeat,
+        nextOccurrenceSpawned: shouldSpawnNext
+          ? true
+          : existing.nextOccurrenceSpawned,
+        updatedAt: nowIso,
+      };
+
+      const nextTasks: Record<string, TaskMetadata> = {
+        ...prev.tasks_metadata,
+        [taskId]: updatedExisting,
+      };
+
+      if (shouldSpawnNext && effectiveRepeat) {
+        const nextId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const nextDue = computeNextDueDate(updatedExisting.due, effectiveRepeat);
+        nextTasks[nextId] = {
+          google_task_id: nextId,
+          subjectId: updatedExisting.subjectId,
+          title: updatedExisting.title,
+          notes: updatedExisting.notes,
+          due: nextDue,
+          status: 'needsAction',
+          estimated_minutes: updatedExisting.estimated_minutes,
+          logged_minutes: 0,
+          priority: updatedExisting.priority,
+          repeat: effectiveRepeat,
+          updatedAt: nowIso,
+        };
+      }
+
       return {
         ...prev,
-        tasks_metadata: {
-          ...prev.tasks_metadata,
-          [taskId]: {
-            ...existing,
-            ...patch,
-            updatedAt: new Date().toISOString(),
-          },
-        },
+        tasks_metadata: nextTasks,
       };
-    });
+    }, willRollForward);
   };
 
   const handleDeleteTask = (taskId: string) => {
@@ -992,7 +1049,7 @@ export default function App() {
         onDeleteSubject={(subjId) =>
           mutateDb((prev) => {
             const remaining = prev.subjects.filter((s) => s.id !== subjId);
-            const fallbackId = remaining[0]?.id || 'subj-general';
+            const fallbackId = remaining[0]?.id || '';
             const nextTasks: Record<string, TaskMetadata> = {};
             for (const [k, t] of Object.entries(prev.tasks_metadata)) {
               nextTasks[k] = t.subjectId === subjId ? { ...t, subjectId: fallbackId } : t;
@@ -1011,19 +1068,67 @@ export default function App() {
             settings: { ...prev.settings, dailyGoalMinutes: mins },
           }))
         }
-        onResetWorkspace={(mode) => {
-          const fresh =
-            mode === 'sample'
-              ? createInitialDatabase()
-              : createEmptyDatabase(db.settings.theme);
-          mutateDb(() => fresh);
+        onResetAllData={async () => {
+          if (debounceTimerRef.current) {
+            window.clearTimeout(debounceTimerRef.current);
+            debounceTimerRef.current = null;
+          }
+          dirtyRef.current = false;
+
+          const emptyDb = createEmptyDatabase(db.settings.theme);
+          setDb(emptyDb);
+          setTimer({
+            mode: 'pomodoro_25',
+            phase: 'focus',
+            status: 'idle',
+            startedAtMs: null,
+            accumulatedMs: 0,
+            targetDurationMs: 25 * 60 * 1000,
+            subjectId: '',
+            title: 'Focus Session',
+          });
+          setElapsedMs(0);
+
+          try {
+            localStorage.setItem(DB_STORAGE_KEY, JSON.stringify(emptyDb));
+            localStorage.removeItem(TIMER_STORAGE_KEY);
+          } catch {
+            // Ignore storage errors
+          }
+
+          const token = getAccessToken();
+          if (token && navigator.onLine) {
+            setSyncStatus((prev) => ({ ...prev, state: 'syncing', errorMessage: undefined }));
+            try {
+              const saved = await overwriteDriveSyncFile({
+                token,
+                emptyDb,
+                knownRemoteFileId: syncStatusRef.current.remoteFileId,
+              });
+              setSyncStatus((prev) => ({
+                ...prev,
+                state: 'synced',
+                lastSyncedAt: new Date().toISOString(),
+                remoteFileId: saved.remoteFileId,
+                remoteModifiedTime: saved.remoteModifiedTime,
+                errorMessage: undefined,
+              }));
+            } catch (err) {
+              setSyncStatus((prev) => ({
+                ...prev,
+                state: 'error',
+                errorMessage:
+                  err instanceof Error ? err.message : 'Failed to overwrite study_sync.json.',
+              }));
+            }
+          }
         }}
       />
 
       <SessionCompleteModal
         isOpen={showLogModal}
         title={timer.title}
-        subjectName={activeSubject?.name || 'General'}
+        subjectName={activeSubject?.name || 'No Subject'}
         durationSeconds={Math.round(elapsedMs / 1000)}
         onSave={handleSaveSession}
         onDiscard={() => {

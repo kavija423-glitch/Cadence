@@ -34,7 +34,7 @@ interface GoogleSetupModalProps {
   onDeleteSubject: (id: string) => void;
   dailyGoalMinutes: number;
   onUpdateDailyGoal: (mins: number) => void;
-  onResetWorkspace: (mode: 'sample' | 'empty') => void;
+  onResetAllData: () => Promise<void>;
 }
 
 export const GoogleSetupModal: React.FC<GoogleSetupModalProps> = ({
@@ -54,13 +54,14 @@ export const GoogleSetupModal: React.FC<GoogleSetupModalProps> = ({
   onDeleteSubject,
   dailyGoalMinutes,
   onUpdateDailyGoal,
-  onResetWorkspace,
+  onResetAllData,
 }) => {
   const [draftClientId, setDraftClientId] = useState(clientId);
   const [newSubjectName, setNewSubjectName] = useState('');
   const [newSubjectColor, setNewSubjectColor] = useState(SUBJECT_COLORS[0]);
   const [copiedOrigin, setCopiedOrigin] = useState(false);
-  const [confirmReset, setConfirmReset] = useState<'sample' | 'empty' | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
 
   if (!isOpen) return null;
@@ -272,24 +273,28 @@ export const GoogleSetupModal: React.FC<GoogleSetupModalProps> = ({
               </p>
             </div>
 
-            <div className="divide-y divide-slate-100 dark:divide-slate-800 rounded-xl border border-slate-200 dark:border-slate-800">
-              {subjects.map((s) => (
-                <div key={s.id} className="flex items-center justify-between px-3.5 py-2.5">
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <span
-                      className="w-3 h-3 rounded-sm shrink-0"
-                      style={{ backgroundColor: s.color }}
-                    />
-                    <span className="text-sm font-medium text-slate-800 dark:text-slate-200 truncate">
-                      {s.name}
-                    </span>
-                    {s.googleTaskListId && (
-                      <span className="text-xs text-slate-400 dark:text-slate-500 whitespace-nowrap">
-                        · Synced List
+            {subjects.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-200 dark:border-slate-800 px-4 py-5 text-center text-xs text-slate-500 dark:text-slate-400">
+                No subjects yet. Add your first subject below or sync from Google Tasks.
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100 dark:divide-slate-800 rounded-xl border border-slate-200 dark:border-slate-800">
+                {subjects.map((s) => (
+                  <div key={s.id} className="flex items-center justify-between px-3.5 py-2.5">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <span
+                        className="w-3 h-3 rounded-sm shrink-0"
+                        style={{ backgroundColor: s.color }}
+                      />
+                      <span className="text-sm font-medium text-slate-800 dark:text-slate-200 truncate">
+                        {s.name}
                       </span>
-                    )}
-                  </div>
-                  {subjects.length > 1 && (
+                      {s.googleTaskListId && (
+                        <span className="text-xs text-slate-400 dark:text-slate-500 whitespace-nowrap">
+                          · Synced List
+                        </span>
+                      )}
+                    </div>
                     <button
                       type="button"
                       onClick={() => onDeleteSubject(s.id)}
@@ -298,10 +303,10 @@ export const GoogleSetupModal: React.FC<GoogleSetupModalProps> = ({
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
-                  )}
-                </div>
-              ))}
-            </div>
+                  </div>
+                ))}
+              </div>
+            )}
 
             <form onSubmit={handleAddSubjectSubmit} className="flex flex-wrap items-center gap-2">
               <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 px-2 py-1.5">
@@ -394,40 +399,44 @@ export const GoogleSetupModal: React.FC<GoogleSetupModalProps> = ({
               {!confirmReset ? (
                 <button
                   type="button"
-                  onClick={() => setConfirmReset('empty')}
-                  className="ml-auto text-xs text-slate-500 hover:text-rose-600 dark:hover:text-rose-400 transition-colors cursor-pointer"
+                  onClick={() => setConfirmReset(true)}
+                  className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-rose-200 dark:border-rose-900/60 px-3 py-2 text-xs font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
                 >
-                  Clear local data...
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Reset All Data
                 </button>
               ) : (
-                <div className="ml-auto flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onResetWorkspace('empty');
-                      setConfirmReset(null);
-                    }}
-                    className="rounded-lg bg-rose-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-rose-700 cursor-pointer"
-                  >
-                    Confirm Clear All
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onResetWorkspace('sample');
-                      setConfirmReset(null);
-                    }}
-                    className="rounded-lg border border-slate-200 dark:border-slate-700 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
-                  >
-                    Restore Demo
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setConfirmReset(null)}
-                    className="text-xs text-slate-500 px-1.5 py-1 cursor-pointer"
-                  >
-                    Cancel
-                  </button>
+                <div className="w-full mt-2 rounded-xl border border-rose-200 dark:border-rose-900/60 bg-rose-50/70 dark:bg-rose-950/30 p-3 flex flex-wrap items-center justify-between gap-3">
+                  <p className="text-xs text-rose-800 dark:text-rose-200">
+                    Clear all local subjects, tasks, blocks, and study stats
+                    {isConnected ? ' and overwrite study_sync.json with an empty state' : ''}?
+                  </p>
+                  <div className="flex items-center gap-2 ml-auto">
+                    <button
+                      type="button"
+                      disabled={isResetting}
+                      onClick={() => setConfirmReset(false)}
+                      className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isResetting}
+                      onClick={async () => {
+                        setIsResetting(true);
+                        try {
+                          await onResetAllData();
+                          setConfirmReset(false);
+                        } finally {
+                          setIsResetting(false);
+                        }
+                      }}
+                      className="rounded-lg bg-rose-600 hover:bg-rose-700 disabled:opacity-60 px-3 py-1.5 text-xs font-medium text-white cursor-pointer"
+                    >
+                      {isResetting ? 'Resetting...' : 'Confirm Reset All Data'}
+                    </button>
+                  </div>
                 </div>
               )}
             </div>

@@ -282,8 +282,8 @@ export const StudyTimerFocusView: React.FC<
                     const subj = subjects.find((s) => s.id === timer.subjectId) || subjects[0];
                     onSelectContext({
                       taskId: undefined,
-                      subjectId: subj?.id || 'subj-general',
-                      title: `${subj?.name || 'Study'} Deep Focus`,
+                      subjectId: subj?.id || '',
+                      title: subj ? `${subj.name} Deep Focus` : 'Focus Session',
                     });
                     return;
                   }
@@ -316,11 +316,16 @@ export const StudyTimerFocusView: React.FC<
                   onSelectContext({
                     taskId: timer.taskId,
                     subjectId: e.target.value,
-                    title: timer.taskId ? timer.title : `${subj?.name || 'Study'} Deep Focus`,
+                    title: timer.taskId
+                      ? timer.title
+                      : subj
+                      ? `${subj.name} Deep Focus`
+                      : 'Focus Session',
                   });
                 }}
                 className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-xs text-slate-900 dark:text-slate-100"
               >
+                <option value="">No Subject</option>
                 {subjects.map((s) => (
                   <option key={s.id} value={s.id}>
                     {s.name}
@@ -385,7 +390,7 @@ export const StudyTimerDockedBar: React.FC<{
           {timer.title}
         </span>
         <span className="hidden sm:inline text-xs text-slate-400 shrink-0">
-          · {subj?.name || 'General'}
+          · {subj?.name || 'No Subject'}
         </span>
       </button>
 

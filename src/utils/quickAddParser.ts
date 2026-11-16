@@ -1,5 +1,6 @@
-import type { Priority, Subject } from '../types';
+import type { Priority, RepeatRule, Subject } from '../types';
 import { addDays, toLocalDateKey } from './dateUtils';
+import { extractRepeatFromText } from './recurrence';
 
 export interface ParsedQuickTask {
   title: string;
@@ -8,6 +9,7 @@ export interface ParsedQuickTask {
   estimatedMinutes: number;
   priority: Priority;
   due?: string;
+  repeat?: RepeatRule;
 }
 
 export function parseQuickAddTask(
@@ -17,7 +19,12 @@ export function parseQuickAddTask(
 ): ParsedQuickTask {
   let text = rawInput.trim();
 
-  // 1. Parse priority: !high, !med, !medium, !low
+  // 1. Parse repeat rule ("every day", "every mon,wed,fri", "weekly", etc.)
+  const repeatParsed = extractRepeatFromText(text);
+  text = repeatParsed.cleanedText;
+  const repeat = repeatParsed.repeat;
+
+  // 2. Parse priority: !high, !med, !medium, !low
   let priority: Priority = 'medium';
   const prioMatch = text.match(/(?:^|\s)!(high|med|medium|low)(?=\s|$)/i);
   if (prioMatch) {
@@ -26,7 +33,7 @@ export function parseQuickAddTask(
     text = text.replace(prioMatch[0], ' ').trim();
   }
 
-  // 2. Parse duration: 60m, 45min, 1.5h, 2h
+  // 3. Parse duration: 60m, 45min, 1.5h, 2h
   let estimatedMinutes = 45;
   const durMatch = text.match(/(?:^|\s)(\d+(?:\.\d+)?)\s*(h|hr|hrs|m|min|mins)(?=\s|$)/i);
   if (durMatch) {
@@ -37,7 +44,7 @@ export function parseQuickAddTask(
     text = text.replace(durMatch[0], ' ').trim();
   }
 
-  // 3. Parse due token: @today, @tomorrow, @YYYY-MM-DD or bare YYYY-MM-DD
+  // 4. Parse due token: @today, @tomorrow, @YYYY-MM-DD or bare YYYY-MM-DD
   let due: string | undefined;
   const dueTokenMatch = text.match(/(?:^|\s)@(today|tomorrow|\d{4}-\d{2}-\d{2})(?=\s|$)/i);
   if (dueTokenMatch) {
@@ -58,9 +65,14 @@ export function parseQuickAddTask(
     }
   }
 
-  // 4. Parse subject tag: #Physics or #Organic-Chemistry
-  let subjectId = fallbackSubjectId || subjects[0]?.id || 'subj-general';
-  let subjectName = subjects.find((s) => s.id === subjectId)?.name || 'General';
+  // If a repeating task has no explicit due date, default initial due to today
+  if (repeat && !due) {
+    due = toLocalDateKey(new Date());
+  }
+
+  // 5. Parse subject tag: #Physics or #Organic-Chemistry
+  let subjectId = fallbackSubjectId || subjects[0]?.id || '';
+  let subjectName = subjects.find((s) => s.id === subjectId)?.name || 'No Subject';
   const subjMatch = text.match(/(?:^|\s)#([a-zA-Z0-9_-]+)/);
   if (subjMatch) {
     const needle = subjMatch[1].replace(/[-_]/g, ' ').toLowerCase();
@@ -86,5 +98,6 @@ export function parseQuickAddTask(
     estimatedMinutes,
     priority,
     due,
+    repeat,
   };
 }

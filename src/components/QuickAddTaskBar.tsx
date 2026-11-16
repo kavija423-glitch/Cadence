@@ -1,8 +1,9 @@
 import React, { useMemo, useState } from 'react';
-import { Plus } from 'lucide-react';
-import type { Priority, Subject } from '../types';
+import { Plus, Repeat } from 'lucide-react';
+import type { Priority, RepeatRule, Subject } from '../types';
 import { parseQuickAddTask } from '../utils/quickAddParser';
 import { formatDurationCompact, formatShortDate } from '../utils/dateUtils';
+import { formatRepeatLabel } from '../utils/recurrence';
 
 interface QuickAddTaskBarProps {
   subjects: Subject[];
@@ -14,6 +15,7 @@ interface QuickAddTaskBarProps {
     estimatedMinutes: number;
     priority: Priority;
     due?: string;
+    repeat?: RepeatRule;
   }) => void;
 }
 
@@ -24,12 +26,14 @@ export const QuickAddTaskBar: React.FC<QuickAddTaskBarProps> = ({
   onCreateTask,
 }) => {
   const [input, setInput] = useState('');
-  const fallbackId = defaultSubjectId || subjects[0]?.id || 'subj-general';
+  const fallbackId = defaultSubjectId || subjects[0]?.id || '';
 
   const parsed = useMemo(
     () => parseQuickAddTask(input, subjects, fallbackId),
     [input, subjects, fallbackId]
   );
+
+  const repeatLabel = formatRepeatLabel(parsed.repeat);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -40,6 +44,7 @@ export const QuickAddTaskBar: React.FC<QuickAddTaskBarProps> = ({
       estimatedMinutes: parsed.estimatedMinutes,
       priority: parsed.priority,
       due: parsed.due,
+      repeat: parsed.repeat,
     });
     setInput('');
   };
@@ -51,7 +56,7 @@ export const QuickAddTaskBar: React.FC<QuickAddTaskBarProps> = ({
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder='Quick add: "Revise Past Paper #Physics 60m !high @today"'
+          placeholder='Quick add: "Revise Past Paper #Physics 60m !high @today weekly"'
           className={`flex-1 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600 ${
             compact ? 'px-3 py-2 text-xs' : 'px-3.5 py-2.5 text-sm'
           }`}
@@ -95,6 +100,15 @@ export const QuickAddTaskBar: React.FC<QuickAddTaskBarProps> = ({
             <>
               <span aria-hidden="true">·</span>
               <span>Due {formatShortDate(parsed.due)}</span>
+            </>
+          )}
+          {repeatLabel && (
+            <>
+              <span aria-hidden="true">·</span>
+              <span className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400 font-medium">
+                <Repeat className="w-3 h-3" />
+                {repeatLabel}
+              </span>
             </>
           )}
         </div>

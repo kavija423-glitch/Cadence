@@ -7,10 +7,14 @@ import {
   Trash2,
   Search,
   X,
+  Plus,
+  Repeat,
 } from 'lucide-react';
 import type {
   CalendarBlock,
   Priority,
+  RepeatRule,
+  RepeatType,
   Subject,
   TaskFilter,
   TaskMetadata,
@@ -21,7 +25,30 @@ import {
   formatShortDate,
   toLocalDateKey,
 } from '../utils/dateUtils';
+import { formatRepeatLabel, normalizeRepeatRule } from '../utils/recurrence';
 import { QuickAddTaskBar } from './QuickAddTaskBar';
+
+const WEEKDAY_BUTTONS: Array<{ day: number; label: string }> = [
+  { day: 1, label: 'Mon' },
+  { day: 2, label: 'Tue' },
+  { day: 3, label: 'Wed' },
+  { day: 4, label: 'Thu' },
+  { day: 5, label: 'Fri' },
+  { day: 6, label: 'Sat' },
+  { day: 0, label: 'Sun' },
+];
+
+interface TaskFormState {
+  mode: 'create' | 'edit';
+  taskId?: string;
+  title: string;
+  subjectId: string;
+  priority: Priority;
+  estimated_minutes: number;
+  due: string;
+  notes: string;
+  repeat: RepeatRule;
+}
 
 interface TaskManagerViewProps {
   subjects: Subject[];
@@ -34,6 +61,7 @@ interface TaskManagerViewProps {
     priority: Priority;
     due?: string;
     notes?: string;
+    repeat?: RepeatRule;
   }) => void;
   onUpdateTask: (taskId: string, patch: Partial<TaskMetadata>) => void;
   onDeleteTask: (taskId: string) => void;
@@ -56,7 +84,7 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
   const [filter, setFilter] = useState<TaskFilter>('today');
   const [subjectFilter, setSubjectFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
-  const [editingTask, setEditingTask] = useState<TaskMetadata | null>(null);
+  const [taskForm, setTaskForm] = useState<TaskFormState | null>(null);
   const [schedulingTask, setSchedulingTask] = useState<TaskMetadata | null>(null);
   const [confirmDeleteTask, setConfirmDeleteTask] = useState<TaskMetadata | null>(null);
 
@@ -144,18 +172,97 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
     setSchedulingTask(null);
   };
 
-  const handleEditSave = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingTask) return;
-    onUpdateTask(editingTask.google_task_id, {
-      title: editingTask.title,
-      subjectId: editingTask.subjectId,
-      estimated_minutes: editingTask.estimated_minutes,
-      priority: editingTask.priority,
-      due: editingTask.due || undefined,
-      notes: editingTask.notes || undefined,
+  const openCreateModal = () => {
+    const defaultSubj = subjectFilter !== 'all' ? subjectFilter : subjects[0]?.id || '';
+    setTaskForm({
+      mode: 'create',
+      title: '',
+      subjectId: defaultSubj,
+      priority: 'medium',
+      estimated_minutes: 45,
+      due: filter === 'today' ? todayKey : '',
+      notes: '',
+      repeat: { type: 'none' },
     });
-    setEditingTask(null);
+  };
+
+  const openEditModal = (task: TaskMetadata) => {
+    setTaskForm({
+      mode: 'edit',
+      taskId: task.google_task_id,
+      title: task.title,
+      subjectId: task.subjectId,
+      priority: task.priority,
+      estimated_minutes: task.estimated_minutes,
+      due: task.due || '',
+      notes: task.notes || '',
+      repeat: task.repeat
+        ? { type: task.repeat.type, daysOfWeek: task.repeat.daysOfWeek ? [...task.repeat.daysOfWeek] : undefined }
+        : { type: 'none' },
+    });
+  };
+
+  const handleRepeatTypeChange = (nextType: RepeatType) => {
+    if (!taskForm) return;
+    let nextRepeat: RepeatRule;
+    if (nextType === 'custom') {
+      const existingDays =
+        taskForm.repeat.daysOfWeek && taskForm.repeat.daysOfWeek.length > 0
+          ? taskForm.repeat.daysOfWeek
+          : [new Date().getDay()];
+      nextRepeat = { type: 'custom', daysOfWeek: existingDays };
+    } else {
+      nextRepeat = { type: nextType };
+    }
+    const nextDue =
+      nextType !== 'none' && !taskForm.due
+        ? todayKey
+        : taskForm.due;
+    setTaskForm({ ...taskForm, repeat: nextRepeat, due: nextDue });
+  };
+
+  const toggleCustomDay = (day: number) => {
+    if (!taskForm) return;
+    const current = taskForm.repeat.daysOfWeek || [];
+    const exists = current.includes(day);
+    if (exists && current.length === 1) return; // keep at least one weekday selected
+    const updated = exists
+      ? current.filter((d) => d !== day)
+      : [...current, day].sort((a, b) => a - b);
+    setTaskForm({
+      ...taskForm,
+      repeat: { type: 'custom', daysOfWeek: updated },
+    });
+  };
+
+  const handleTaskFormSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!taskForm || !taskForm.title.trim()) return;
+    const cleanRepeat = normalizeRepeatRule(taskForm.repeat);
+    const cleanDue = taskForm.due || (cleanRepeat ? todayKey : undefined);
+
+    if (taskForm.mode === 'create') {
+      onCreateTask({
+        title: taskForm.title.trim(),
+        subjectId: taskForm.subjectId,
+        estimatedMinutes: taskForm.estimated_minutes,
+        priority: taskForm.priority,
+        due: cleanDue,
+        notes: taskForm.notes.trim() || undefined,
+        repeat: cleanRepeat,
+      });
+    } else if (taskForm.taskId) {
+      onUpdateTask(taskForm.taskId, {
+        title: taskForm.title.trim(),
+        subjectId: taskForm.subjectId,
+        estimated_minutes: taskForm.estimated_minutes,
+        priority: taskForm.priority,
+        due: cleanDue,
+        notes: taskForm.notes.trim() || undefined,
+        repeat: cleanRepeat,
+      });
+    }
+    setTaskForm(null);
   };
 
   const filterTabs: Array<{ id: TaskFilter; label: string; count: number }> = [
@@ -170,19 +277,29 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
     <div className="mx-auto max-w-5xl px-4 sm:px-6 py-6 space-y-6">
       {/* Header + Quick Add */}
       <div className="space-y-4">
-        <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100">
               Study Tasks
             </h1>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
               Type <code className="font-mono">#Subject</code>, duration like{' '}
-              <code className="font-mono">60m</code>, priority <code className="font-mono">!high</code>, or{' '}
-              <code className="font-mono">@today</code>
+              <code className="font-mono">60m</code>, priority <code className="font-mono">!high</code>,{' '}
+              <code className="font-mono">@today</code>, or <code className="font-mono">every mon,wed,fri</code>
             </p>
           </div>
-          <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-            {counts.today} due today · {counts.unscheduled} unscheduled
+          <div className="flex items-center gap-3">
+            <span className="hidden sm:inline text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+              {counts.today} due today · {counts.unscheduled} unscheduled
+            </span>
+            <button
+              type="button"
+              onClick={openCreateModal}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>New Task</span>
+            </button>
           </div>
         </div>
 
@@ -260,6 +377,7 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
             const isCompleted = task.status === 'completed';
             const isScheduled = scheduledTaskIds.has(task.google_task_id);
             const isOverdue = !!task.due && task.due < todayKey && !isCompleted;
+            const repeatLabel = formatRepeatLabel(task.repeat);
 
             return (
               <div
@@ -304,7 +422,7 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
 
                     {/* Zero-Pill Clean Inline Metadata */}
                     <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500 dark:text-slate-400">
-                      <span>{subj?.name || 'General'}</span>
+                      <span>{subj?.name || 'No Subject'}</span>
                       <span aria-hidden="true">·</span>
                       <span className="font-mono tabular-nums">
                         {formatDurationCompact(task.estimated_minutes)} est
@@ -344,6 +462,15 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
                           </span>
                         </>
                       )}
+                      {repeatLabel && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400">
+                            <Repeat className="w-3 h-3" />
+                            {repeatLabel}
+                          </span>
+                        </>
+                      )}
                       {isScheduled && (
                         <>
                           <span aria-hidden="true">·</span>
@@ -378,7 +505,7 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setEditingTask({ ...task })}
+                    onClick={() => openEditModal(task)}
                     className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:text-slate-900 dark:hover:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
                     title="Edit task"
                     aria-label={`Edit ${task.title}`}
@@ -401,21 +528,21 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
         </div>
       )}
 
-      {/* Edit Task Modal */}
-      {editingTask && (
+      {/* Create / Edit Task Modal */}
+      {taskForm && (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/50 backdrop-blur-xs p-0 sm:p-4">
           <form
-            onSubmit={handleEditSave}
-            className="w-full max-w-md rounded-t-3xl sm:rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4 shadow-2xl"
+            onSubmit={handleTaskFormSubmit}
+            className="w-full max-w-md max-h-[90vh] overflow-y-auto rounded-t-3xl sm:rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4 shadow-2xl"
           >
             <div className="flex items-center justify-between">
               <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-                Edit Study Task
+                {taskForm.mode === 'create' ? 'New Study Task' : 'Edit Study Task'}
               </h3>
               <button
                 type="button"
-                onClick={() => setEditingTask(null)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                onClick={() => setTaskForm(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -429,9 +556,10 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
                 <input
                   type="text"
                   required
-                  value={editingTask.title}
+                  placeholder="e.g., Revise Organic Chemistry"
+                  value={taskForm.title}
                   onChange={(e) =>
-                    setEditingTask({ ...editingTask, title: e.target.value })
+                    setTaskForm({ ...taskForm, title: e.target.value })
                   }
                   className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100"
                 />
@@ -443,12 +571,13 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
                     Subject
                   </label>
                   <select
-                    value={editingTask.subjectId}
+                    value={taskForm.subjectId}
                     onChange={(e) =>
-                      setEditingTask({ ...editingTask, subjectId: e.target.value })
+                      setTaskForm({ ...taskForm, subjectId: e.target.value })
                     }
                     className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100"
                   >
+                    <option value="">No Subject</option>
                     {subjects.map((s) => (
                       <option key={s.id} value={s.id}>
                         {s.name}
@@ -462,10 +591,10 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
                     Priority
                   </label>
                   <select
-                    value={editingTask.priority}
+                    value={taskForm.priority}
                     onChange={(e) =>
-                      setEditingTask({
-                        ...editingTask,
+                      setTaskForm({
+                        ...taskForm,
                         priority: e.target.value as Priority,
                       })
                     }
@@ -488,10 +617,10 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
                     min={15}
                     max={480}
                     step={15}
-                    value={editingTask.estimated_minutes}
+                    value={taskForm.estimated_minutes}
                     onChange={(e) =>
-                      setEditingTask({
-                        ...editingTask,
+                      setTaskForm({
+                        ...taskForm,
                         estimated_minutes: Math.max(15, Number(e.target.value) || 15),
                       })
                     }
@@ -505,16 +634,63 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
                   </label>
                   <input
                     type="date"
-                    value={editingTask.due || ''}
+                    value={taskForm.due}
                     onChange={(e) =>
-                      setEditingTask({
-                        ...editingTask,
-                        due: e.target.value || undefined,
+                      setTaskForm({
+                        ...taskForm,
+                        due: e.target.value,
                       })
                     }
                     className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm font-mono text-slate-900 dark:text-slate-100"
                   />
                 </div>
+              </div>
+
+              {/* Repeat Selector */}
+              <div className="space-y-2">
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Repeat
+                </label>
+                <select
+                  value={taskForm.repeat.type}
+                  onChange={(e) => handleRepeatTypeChange(e.target.value as RepeatType)}
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100"
+                >
+                  <option value="none">None</option>
+                  <option value="daily">Daily</option>
+                  <option value="weekdays">Weekdays (Mon–Fri)</option>
+                  <option value="weekly">Weekly</option>
+                  <option value="monthly">Monthly</option>
+                  <option value="custom">Custom Days of Week</option>
+                </select>
+
+                {taskForm.repeat.type === 'custom' && (
+                  <div className="grid grid-cols-7 gap-1 pt-0.5">
+                    {WEEKDAY_BUTTONS.map(({ day, label }) => {
+                      const active = (taskForm.repeat.daysOfWeek || []).includes(day);
+                      return (
+                        <button
+                          key={day}
+                          type="button"
+                          onClick={() => toggleCustomDay(day)}
+                          className={`py-1.5 rounded-lg text-[11px] font-medium border transition-colors cursor-pointer ${
+                            active
+                              ? 'border-blue-600 bg-blue-600 text-white'
+                              : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-600 dark:text-slate-300 hover:border-slate-300 dark:hover:border-slate-600'
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {taskForm.repeat.type !== 'none' && (
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    When completed, history is preserved and the next occurrence is scheduled automatically.
+                  </p>
+                )}
               </div>
 
               <div>
@@ -523,9 +699,9 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
                 </label>
                 <textarea
                   rows={2}
-                  value={editingTask.notes || ''}
+                  value={taskForm.notes}
                   onChange={(e) =>
-                    setEditingTask({ ...editingTask, notes: e.target.value })
+                    setTaskForm({ ...taskForm, notes: e.target.value })
                   }
                   className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100"
                 />
@@ -535,7 +711,7 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
             <div className="flex justify-end gap-2 pt-2">
               <button
                 type="button"
-                onClick={() => setEditingTask(null)}
+                onClick={() => setTaskForm(null)}
                 className="rounded-lg border border-slate-200 dark:border-slate-700 px-4 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
               >
                 Cancel
@@ -544,7 +720,7 @@ export const TaskManagerView: React.FC<TaskManagerViewProps> = ({
                 type="submit"
                 className="rounded-lg bg-blue-600 hover:bg-blue-700 px-4 py-2 text-xs font-medium text-white cursor-pointer"
               >
-                Save Changes
+                {taskForm.mode === 'create' ? 'Create Task' : 'Save Changes'}
               </button>
             </div>
           </form>

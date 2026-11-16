@@ -16,6 +16,13 @@ export interface Subject {
   updatedAt: string;
 }
 
+export type RepeatType = 'none' | 'daily' | 'weekdays' | 'weekly' | 'monthly' | 'custom';
+
+export interface RepeatRule {
+  type: RepeatType;
+  daysOfWeek?: number[]; // 0=Sun, 1=Mon, ..., 6=Sat
+}
+
 export interface TaskMetadata {
   google_task_id: string; // Maps to Google Task ID when synced, or local UUID until synced
   googleTaskListId?: string;
@@ -28,6 +35,8 @@ export interface TaskMetadata {
   estimated_minutes: number;
   logged_minutes: number;
   priority: Priority;
+  repeat?: RepeatRule;
+  nextOccurrenceSpawned?: boolean;
   updatedAt: string;
   deleted?: boolean;
 }

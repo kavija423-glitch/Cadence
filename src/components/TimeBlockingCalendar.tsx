@@ -10,12 +10,14 @@ import {
   X,
   Trash2,
   Flag,
+  Repeat,
 } from 'lucide-react';
 import type {
   CalendarBlock,
   ExamCountdown,
   GoogleCalendarEventOverlay,
   Priority,
+  RepeatRule,
   Subject,
   TaskMetadata,
 } from '../types';
@@ -29,6 +31,7 @@ import {
   snapMinutes15,
   toLocalDateKey,
 } from '../utils/dateUtils';
+import { formatRepeatLabel } from '../utils/recurrence';
 import { QuickAddTaskBar } from './QuickAddTaskBar';
 
 const START_HOUR = 6;
@@ -50,6 +53,7 @@ interface TimeBlockingCalendarProps {
     estimatedMinutes: number;
     priority: Priority;
     due?: string;
+    repeat?: RepeatRule;
   }) => void;
   onCreateBlock: (block: Omit<CalendarBlock, 'id' | 'updatedAt'>) => void;
   onUpdateBlock: (blockId: string, patch: Partial<CalendarBlock>) => void;
@@ -289,7 +293,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
     e.preventDefault();
     if (!creatingSlot || !newBlockTitle.trim()) return;
     onCreateBlock({
-      subjectId: newBlockSubjectId || subjects[0]?.id || 'subj-general',
+      subjectId: newBlockSubjectId || subjects[0]?.id || '',
       title: newBlockTitle.trim(),
       date: creatingSlot.date,
       startMinutes: creatingSlot.startMinutes,
@@ -303,7 +307,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
     if (!examTitle.trim() || !examDate) return;
     onAddExam({
       title: examTitle.trim(),
-      subjectId: examSubjectId || subjects[0]?.id || 'subj-general',
+      subjectId: examSubjectId || subjects[0]?.id || '',
       date: examDate,
     });
     setExamTitle('');
@@ -536,7 +540,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
                             className="inline-block w-2 h-2 rounded-xs shrink-0"
                             style={{ backgroundColor: subj?.color || '#64748b' }}
                           />
-                          <span>{subj?.name || 'General'}</span>
+                          <span>{subj?.name || 'No Subject'}</span>
                           <span aria-hidden="true">·</span>
                           <span className="font-mono tabular-nums">
                             {formatDurationCompact(task.estimated_minutes)}
@@ -545,6 +549,15 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
                             <>
                               <span aria-hidden="true">·</span>
                               <span>{formatShortDate(task.due)}</span>
+                            </>
+                          )}
+                          {formatRepeatLabel(task.repeat) && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span className="inline-flex items-center gap-0.5 text-blue-600 dark:text-blue-400">
+                                <Repeat className="w-2.5 h-2.5" />
+                                {formatRepeatLabel(task.repeat)}
+                              </span>
                             </>
                           )}
                         </div>
@@ -941,6 +954,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
                   onChange={(e) => setNewBlockSubjectId(e.target.value)}
                   className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100"
                 >
+                  <option value="">No Subject</option>
                   {subjects.map((s) => (
                     <option key={s.id} value={s.id}>
                       {s.name}
@@ -1013,6 +1027,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
                   onChange={(e) => setExamSubjectId(e.target.value)}
                   className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-slate-100"
                 >
+                  <option value="">No Subject</option>
                   {subjects.map((s) => (
                     <option key={s.id} value={s.id}>
                       {s.name}

@@ -13,6 +13,8 @@ import {
   getWeekStart,
   toLocalDateKey,
 } from '../utils/dateUtils';
+import { FocusHoursChart } from './FocusHoursChart';
+import { TimeframeSwitcher, type AnalyticsTimeframe } from './TimeframeSwitcher';
 
 interface AnalyticsDashboardProps {
   subjects: Subject[];
@@ -20,6 +22,48 @@ interface AnalyticsDashboardProps {
   blocks: CalendarBlock[];
   sessions: StudySession[];
   dailyGoalMinutes: number;
+}
+
+function getPeriodBounds(timeframe: AnalyticsTimeframe, refDate: Date): {
+  startKey: string;
+  endKey: string;
+  subtitle: string;
+} {
+  const year = refDate.getFullYear();
+  const month = refDate.getMonth();
+
+  if (timeframe === 'week') {
+    const start = getWeekStart(refDate);
+    const end = addDays(start, 6);
+    return {
+      startKey: toLocalDateKey(start),
+      endKey: toLocalDateKey(end),
+      subtitle: `${start.toLocaleDateString(undefined, {
+        month: 'short',
+        day: 'numeric',
+      })} – ${end.toLocaleDateString(undefined, {
+        month: 'short',
+        day: 'numeric',
+      })}`,
+    };
+  }
+
+  if (timeframe === 'month') {
+    const lastDay = new Date(year, month + 1, 0).getDate();
+    const start = new Date(year, month, 1);
+    const end = new Date(year, month, lastDay);
+    return {
+      startKey: toLocalDateKey(start),
+      endKey: toLocalDateKey(end),
+      subtitle: refDate.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }),
+    };
+  }
+
+  return {
+    startKey: `${year}-01-01`,
+    endKey: `${year}-12-31`,
+    subtitle: String(year),
+  };
 }
 
 export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
@@ -30,6 +74,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
   dailyGoalMinutes,
 }) => {
   const [hoveredSubjectId, setHoveredSubjectId] = useState<string | null>(null);
+  const [plannedVsActualTimeframe, setPlannedVsActualTimeframe] =
+    useState<AnalyticsTimeframe>('week');
+  const [distributionTimeframe, setDistributionTimeframe] =
+    useState<AnalyticsTimeframe>('week');
 
   const today = new Date();
   const todayKey = toLocalDateKey(today);
@@ -94,57 +142,81 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
     return (total / sessions.length).toFixed(1);
   }, [sessions]);
 
-  // Planned vs Actual hours per Subject
-  const subjectStats = useMemo(() => {
-    const plannedMap = new Map<string, number>();
-    const actualMap = new Map<string, number>();
+  // Helper: compute Planned vs Actual hours per Subject for a given timeframe
+  const computeSubjectStats = useMemo(() => {
+    return (tf: AnalyticsTimeframe) => {
+      const { startKey, endKey, subtitle } = getPeriodBounds(tf, today);
+      const plannedMap = new Map<string, number>();
+      const actualMap = new Map<string, number>();
 
-    // Planned = scheduled calendar blocks OR estimated task minutes (avoid double counting linked tasks)
-    const accountedTaskIds = new Set<string>();
-    for (const b of blocks) {
-      if (b.deleted) continue;
-      plannedMap.set(b.subjectId, (plannedMap.get(b.subjectId) || 0) + b.durationMinutes);
-      if (b.taskId) accountedTaskIds.add(b.taskId);
-    }
-    for (const t of Object.values(tasks)) {
-      if (t.deleted || accountedTaskIds.has(t.google_task_id)) continue;
-      plannedMap.set(t.subjectId, (plannedMap.get(t.subjectId) || 0) + t.estimated_minutes);
-    }
+      // Planned = scheduled calendar blocks in period + unscheduled tasks due in period
+      const accountedTaskIds = new Set<string>();
+      for (const b of blocks) {
+        if (b.deleted) continue;
+        if (b.date >= startKey && b.date <= endKey) {
+          plannedMap.set(b.subjectId, (plannedMap.get(b.subjectId) || 0) + b.durationMinutes);
+          if (b.taskId) accountedTaskIds.add(b.taskId);
+        }
+      }
+      for (const t of Object.values(tasks)) {
+        if (t.deleted || accountedTaskIds.has(t.google_task_id)) continue;
+        if (t.due && t.due >= startKey && t.due <= endKey) {
+          plannedMap.set(t.subjectId, (plannedMap.get(t.subjectId) || 0) + t.estimated_minutes);
+        }
+      }
 
-    for (const s of sessions) {
-      actualMap.set(s.subjectId, (actualMap.get(s.subjectId) || 0) + s.durationSeconds / 60);
-    }
+      for (const s of sessions) {
+        const dt = new Date(s.startedAt);
+        if (Number.isNaN(dt.getTime())) continue;
+        const k = toLocalDateKey(dt);
+        if (k >= startKey && k <= endKey) {
+          actualMap.set(s.subjectId, (actualMap.get(s.subjectId) || 0) + s.durationSeconds / 60);
+        }
+      }
 
-    return subjects.map((subj) => {
-      const plannedHours = Number(((plannedMap.get(subj.id) || 0) / 60).toFixed(2));
-      const actualHours = Number(((actualMap.get(subj.id) || 0) / 60).toFixed(2));
-      return {
-        subject: subj,
-        plannedHours,
-        actualHours,
-      };
-    });
-  }, [subjects, blocks, tasks, sessions]);
+      const rows = subjects.map((subj) => {
+        const plannedHours = Number(((plannedMap.get(subj.id) || 0) / 60).toFixed(2));
+        const actualHours = Number(((actualMap.get(subj.id) || 0) / 60).toFixed(2));
+        return {
+          subject: subj,
+          plannedHours,
+          actualHours,
+        };
+      });
 
-  const totalActualHours = useMemo(
-    () => subjectStats.reduce((acc, r) => acc + r.actualHours, 0),
-    [subjectStats]
+      return { rows, subtitle };
+    };
+  }, [subjects, blocks, tasks, sessions, today]);
+
+  const plannedVsActual = useMemo(
+    () => computeSubjectStats(plannedVsActualTimeframe),
+    [computeSubjectStats, plannedVsActualTimeframe]
+  );
+
+  const distribution = useMemo(
+    () => computeSubjectStats(distributionTimeframe),
+    [computeSubjectStats, distributionTimeframe]
   );
 
   const maxBarHours = useMemo(() => {
     const peak = Math.max(
       1,
-      ...subjectStats.flatMap((s) => [s.plannedHours, s.actualHours])
+      ...plannedVsActual.rows.flatMap((s) => [s.plannedHours, s.actualHours])
     );
     return Math.ceil(peak);
-  }, [subjectStats]);
+  }, [plannedVsActual.rows]);
+
+  const totalActualHours = useMemo(
+    () => distribution.rows.reduce((acc, r) => acc + r.actualHours, 0),
+    [distribution.rows]
+  );
 
   // Donut segments
   const donutSegments = useMemo(() => {
     const r = 64;
     const c = 2 * Math.PI * r;
     let offset = 0;
-    return subjectStats
+    return distribution.rows
       .filter((s) => s.actualHours > 0)
       .map((s) => {
         const ratio = totalActualHours > 0 ? s.actualHours / totalActualHours : 0;
@@ -158,7 +230,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
         offset += dash;
         return seg;
       });
-  }, [subjectStats, totalActualHours]);
+  }, [distribution.rows, totalActualHours]);
 
   // 28-day activity matrix
   const last28Days = useMemo(() => {
@@ -239,18 +311,28 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
         </div>
       </div>
 
+      {/* Focus Hours Bar Chart with Week / Month / Year Switcher */}
+      <FocusHoursChart sessions={sessions} />
+
       {/* Charts Row: Planned vs Actual + Subject Distribution Donut */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Planned vs Actual Bar Chart */}
         <div className="lg:col-span-7 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-5">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-                Planned vs. Actual Hours
-              </h2>
-              <p className="text-xs text-slate-500 dark:text-slate-400">
-                Scheduled &amp; estimated workload compared to logged focus time
-              </p>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                  Planned vs. Actual Hours
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  {plannedVsActual.subtitle} · Scheduled &amp; due workload vs. logged focus time
+                </p>
+              </div>
+              <TimeframeSwitcher
+                value={plannedVsActualTimeframe}
+                onChange={setPlannedVsActualTimeframe}
+                ariaLabel="Planned vs actual timeframe"
+              />
             </div>
             <div className="flex items-center gap-4 text-xs text-slate-600 dark:text-slate-300">
               <span className="inline-flex items-center gap-1.5">
@@ -264,13 +346,13 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
             </div>
           </div>
 
-          {subjectStats.length === 0 ? (
+          {plannedVsActual.rows.length === 0 ? (
             <div className="py-12 text-center text-xs text-slate-500">
               Add subjects and study sessions to see Planned vs. Actual comparisons.
             </div>
           ) : (
             <div className="space-y-4">
-              {subjectStats.map((row) => {
+              {plannedVsActual.rows.map((row) => {
                 const plannedPct = Math.min(100, (row.plannedHours / maxBarHours) * 100);
                 const actualPct = Math.min(100, (row.actualHours / maxBarHours) * 100);
                 return (
@@ -317,18 +399,28 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
 
         {/* Subject Distribution Donut Chart */}
         <div className="lg:col-span-5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-5">
-          <div>
-            <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-              Subject Distribution
-            </h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Share of total logged study time by subject
-            </p>
+          <div className="flex flex-col gap-3">
+            <div>
+              <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                Subject Distribution
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                {distribution.subtitle} · Share of logged study time by subject
+              </p>
+            </div>
+            <TimeframeSwitcher
+              value={distributionTimeframe}
+              onChange={(tf) => {
+                setDistributionTimeframe(tf);
+                setHoveredSubjectId(null);
+              }}
+              ariaLabel="Subject distribution timeframe"
+            />
           </div>
 
           {totalActualHours <= 0 ? (
             <div className="py-12 text-center text-xs text-slate-500">
-              Complete a study session to populate your subject distribution.
+              No study sessions logged for {distribution.subtitle}.
             </div>
           ) : (
             <div className="flex flex-col sm:flex-row lg:flex-col xl:flex-row items-center gap-6">
@@ -473,7 +565,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({
                           {s.title}
                         </div>
                         <div className="text-slate-500 dark:text-slate-400">
-                          {subj?.name || 'General'} ·{' '}
+                          {subj?.name || 'No Subject'} ·{' '}
                           {new Date(s.startedAt).toLocaleDateString(undefined, {
                             month: 'short',
                             day: 'numeric',

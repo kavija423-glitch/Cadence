@@ -6,6 +6,7 @@ import type {
   TaskMetadata,
 } from '../types';
 import { toLocalDateKey } from '../utils/dateUtils';
+import { parseRepeatFromNotes, syncRepeatMetadataInNotes } from '../utils/recurrence';
 import { SUBJECT_COLORS } from '../utils/seedData';
 
 export const GOOGLE_SCOPES = [
@@ -439,6 +440,7 @@ async function syncGoogleTasksBidirectional(
       const existing = updatedTasks[rt.id];
       const remoteDue = rt.due ? rt.due.slice(0, 10) : undefined;
       const remoteUpdatedMs = rt.updated ? new Date(rt.updated).getTime() : 0;
+      const { cleanNotes, repeat: parsedRepeat } = parseRepeatFromNotes(rt.notes);
 
       if (!existing) {
         updatedTasks[rt.id] = {
@@ -446,13 +448,14 @@ async function syncGoogleTasksBidirectional(
           googleTaskListId: listId,
           subjectId: subj.id,
           title: rt.title || 'Untitled Task',
-          notes: rt.notes,
+          notes: cleanNotes,
           due: remoteDue,
           status: rt.status,
           completedAt: rt.completed,
           estimated_minutes: 45,
           logged_minutes: 0,
           priority: 'medium',
+          repeat: parsedRepeat,
           updatedAt: rt.updated || new Date().toISOString(),
         };
       } else {
@@ -474,10 +477,11 @@ async function syncGoogleTasksBidirectional(
             googleTaskListId: listId,
             subjectId: subj.id,
             title: rt.title || existing.title,
-            notes: rt.notes ?? existing.notes,
+            notes: rt.notes !== undefined ? cleanNotes : existing.notes,
             due: remoteDue,
             status: rt.status,
             completedAt: rt.completed ?? existing.completedAt,
+            repeat: parsedRepeat ?? (rt.notes !== undefined ? undefined : existing.repeat),
             updatedAt: rt.updated || existing.updatedAt,
           };
         } else if (localUpdatedMs > remoteUpdatedMs + 1500) {
@@ -493,7 +497,7 @@ async function syncGoogleTasksBidirectional(
               body: JSON.stringify({
                 id: rt.id,
                 title: existing.title,
-                notes: existing.notes || '',
+                notes: syncRepeatMetadataInNotes(existing.notes, existing.repeat),
                 status: existing.status,
                 due: existing.due ? `${existing.due}T00:00:00.000Z` : null,
               }),
@@ -509,6 +513,7 @@ async function syncGoogleTasksBidirectional(
       if (remoteMap.has(localId)) continue;
       // Only create remotely if it wasn't already synced to a Google ID
       if (!localTask.googleTaskListId) {
+        const serializedNotes = syncRepeatMetadataInNotes(localTask.notes, localTask.repeat);
         const createRes = await googleFetch(
           `https://tasks.googleapis.com/tasks/v1/lists/${encodeURIComponent(listId)}/tasks`,
           token,
@@ -517,7 +522,7 @@ async function syncGoogleTasksBidirectional(
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               title: localTask.title,
-              notes: localTask.notes || undefined,
+              notes: serializedNotes || undefined,
               status: localTask.status,
               due: localTask.due ? `${localTask.due}T00:00:00.000Z` : undefined,
             }),
@@ -709,5 +714,19 @@ export async function performFullGoogleSync(params: {
     remoteFileId: savedMeta.id,
     remoteModifiedTime: savedMeta.modifiedTime,
     calendarEvents,
+  };
+}
+
+export async function overwriteDriveSyncFile(params: {
+  token: string;
+  emptyDb: StudyDatabase;
+  knownRemoteFileId: string | null;
+}): Promise<{ remoteFileId: string; remoteModifiedTime: string }> {
+  const { token, emptyDb, knownRemoteFileId } = params;
+  const targetId = knownRemoteFileId || (await findDriveSyncFile(token))?.id || null;
+  const savedMeta = await uploadDriveSyncFile(token, emptyDb, targetId);
+  return {
+    remoteFileId: savedMeta.id,
+    remoteModifiedTime: savedMeta.modifiedTime,
   };
 }
