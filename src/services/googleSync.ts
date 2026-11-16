@@ -15,41 +15,12 @@ export const GOOGLE_SCOPES = [
 ];
 
 const CLIENT_ID_STORAGE_KEY = 'cadence_google_client_id';
+const OAUTH_STATE_STORAGE_KEY = 'cadence_oauth_state';
 const SYNC_FILENAME = 'study_sync.json';
 
 // Strict in-memory token cache (never stored in localStorage)
 let cachedAccessToken: string | null = null;
 let tokenExpiresAtMs = 0;
-
-interface GoogleTokenResponse {
-  access_token?: string;
-  expires_in?: number;
-  error?: string;
-  error_description?: string;
-}
-
-interface GoogleAccountsOAuth2 {
-  initTokenClient: (config: {
-    client_id: string;
-    scope: string;
-    prompt?: string;
-    callback: (response: GoogleTokenResponse) => void;
-    error_callback?: (err: { type: string; message?: string }) => void;
-  }) => {
-    requestAccessToken: (overrideConfig?: { prompt?: string }) => void;
-  };
-  revoke: (token: string, done: () => void) => void;
-}
-
-declare global {
-  interface Window {
-    google?: {
-      accounts?: {
-        oauth2?: GoogleAccountsOAuth2;
-      };
-    };
-  }
-}
 
 export function getSavedClientId(): string {
   try {
@@ -84,54 +55,99 @@ export function clearAccessToken(): void {
   const token = cachedAccessToken;
   cachedAccessToken = null;
   tokenExpiresAtMs = 0;
-  if (token && window.google?.accounts?.oauth2) {
-    try {
-      window.google.accounts.oauth2.revoke(token, () => {});
-    } catch {
-      // Ignore revoke errors
-    }
+  if (token) {
+    fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+    }).catch(() => {
+      // Ignore revoke network errors
+    });
   }
 }
 
-export async function requestGoogleAccessToken(
-  clientId: string,
-  prompt: '' | 'consent' | 'select_account' = 'consent'
-): Promise<string> {
-  if (!clientId.trim()) {
+export function redirectToGoogleOAuth(clientId: string): void {
+  const trimmedId = clientId.trim();
+  if (!trimmedId) {
     throw new Error('Please paste your Google OAuth Client ID first.');
   }
 
-  // Wait briefly if GIS script is still loading
-  if (!window.google?.accounts?.oauth2) {
-    await new Promise((r) => setTimeout(r, 800));
-  }
-  const oauth2 = window.google?.accounts?.oauth2;
-  if (!oauth2) {
-    throw new Error(
-      'Google Identity Services script failed to load. Check your connection or ad-blocker.'
-    );
+  const state =
+    typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+  try {
+    sessionStorage.setItem(OAUTH_STATE_STORAGE_KEY, state);
+  } catch {
+    // Ignore sessionStorage restrictions
   }
 
-  return new Promise((resolve, reject) => {
-    const tokenClient = oauth2.initTokenClient({
-      client_id: clientId.trim(),
-      scope: GOOGLE_SCOPES.join(' '),
-      callback: (resp) => {
-        if (resp.error || !resp.access_token) {
-          reject(new Error(resp.error_description || resp.error || 'OAuth authorization failed.'));
-          return;
-        }
-        cachedAccessToken = resp.access_token;
-        const expiresIn = resp.expires_in ?? 3600;
-        tokenExpiresAtMs = Date.now() + expiresIn * 1000;
-        resolve(resp.access_token);
-      },
-      error_callback: (err) => {
-        reject(new Error(err.message || `OAuth popup error (${err.type})`));
-      },
-    });
-    tokenClient.requestAccessToken({ prompt });
+  const params = new URLSearchParams({
+    client_id: trimmedId,
+    redirect_uri: window.location.origin,
+    response_type: 'token',
+    scope: GOOGLE_SCOPES.join(' '),
+    include_granted_scopes: 'true',
+    prompt: 'consent',
+    state,
   });
+
+  window.location.assign(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+}
+
+export function parseOAuthCallbackFromHash(): {
+  accessToken?: string;
+  expiresIn?: number;
+  error?: string;
+} {
+  if (typeof window === 'undefined' || !window.location.hash) {
+    return {};
+  }
+
+  const hash = window.location.hash.startsWith('#')
+    ? window.location.hash.slice(1)
+    : window.location.hash;
+
+  if (!hash) return {};
+
+  const params = new URLSearchParams(hash);
+  const accessToken = params.get('access_token');
+  const expiresInRaw = params.get('expires_in');
+  const error = params.get('error');
+  const errorDescription = params.get('error_description');
+  const returnedState = params.get('state');
+
+  if (!accessToken && !error) {
+    return {};
+  }
+
+  // Clean the URL hash immediately so tokens do not linger in address bar/history
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
+
+  let expectedState: string | null = null;
+  try {
+    expectedState = sessionStorage.getItem(OAUTH_STATE_STORAGE_KEY);
+    sessionStorage.removeItem(OAUTH_STATE_STORAGE_KEY);
+  } catch {
+    // Ignore sessionStorage restrictions
+  }
+
+  if (expectedState && returnedState && expectedState !== returnedState) {
+    return { error: 'OAuth state mismatch. Please try connecting again.' };
+  }
+
+  if (error) {
+    return { error: errorDescription || error };
+  }
+
+  if (accessToken) {
+    const expiresIn = expiresInRaw ? parseInt(expiresInRaw, 10) : 3600;
+    const validExpires = Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 3600;
+    cachedAccessToken = accessToken;
+    tokenExpiresAtMs = Date.now() + validExpires * 1000;
+    return { accessToken, expiresIn: validExpires };
+  }
+
+  return {};
 }
 
 async function googleFetch(url: string, token: string, init: RequestInit = {}): Promise<Response> {

@@ -38,8 +38,9 @@ import {
   getAccessToken,
   getSavedClientId,
   hasValidAccessToken,
+  parseOAuthCallbackFromHash,
   performFullGoogleSync,
-  requestGoogleAccessToken,
+  redirectToGoogleOAuth,
   saveClientId,
 } from './services/googleSync';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
@@ -249,7 +250,32 @@ export default function App() {
       });
   }, [weekStart, isGoogleConnected]);
 
-  // Connect with Google Identity Services
+  // Parse OAuth 2.0 implicit flow access_token from window.location.hash on page load
+  useEffect(() => {
+    const { accessToken, error } = parseOAuthCallbackFromHash();
+    if (error) {
+      setSyncStatus((prev) => ({
+        ...prev,
+        state: 'error',
+        errorMessage: error,
+      }));
+      setShowSetupModal(true);
+      return;
+    }
+
+    if (accessToken) {
+      setIsGoogleConnected(true);
+      void (async () => {
+        const email = await fetchUserCalendarEmail(accessToken);
+        setSyncStatus((prev) => ({ ...prev, userEmail: email }));
+        await runSync(accessToken);
+      })();
+    }
+    // Run once on initial mount to handle OAuth redirect callback
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Connect via full-page Google OAuth 2.0 implicit redirect flow
   const handleGoogleConnect = async () => {
     if (!clientId.trim()) {
       setShowSetupModal(true);
@@ -257,11 +283,7 @@ export default function App() {
     }
     setSyncStatus((prev) => ({ ...prev, state: 'connecting', errorMessage: undefined }));
     try {
-      const token = await requestGoogleAccessToken(clientId, 'consent');
-      setIsGoogleConnected(true);
-      const email = await fetchUserCalendarEmail(token);
-      setSyncStatus((prev) => ({ ...prev, userEmail: email }));
-      await runSync(token);
+      redirectToGoogleOAuth(clientId);
     } catch (err) {
       setSyncStatus((prev) => ({
         ...prev,

@@ -114,7 +114,7 @@ export const GoogleSetupModal: React.FC<GoogleSetupModalProps> = ({
               Sync, Google Setup & Preferences
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              100% client-side GIS OAuth · Stored locally and synced to your Drive AppData
+              100% client-side OAuth 2.0 redirect · Stored locally and synced to your Drive AppData
             </p>
           </div>
           <button
@@ -176,7 +176,7 @@ export const GoogleSetupModal: React.FC<GoogleSetupModalProps> = ({
 
               <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-xs text-slate-500 dark:text-slate-400">
                 <span>
-                  Authorized JS Origin:{' '}
+                  Authorized Redirect URI:{' '}
                   <code className="font-mono text-slate-700 dark:text-slate-300">{currentOrigin}</code>
                 </span>
                 <button
@@ -185,7 +185,7 @@ export const GoogleSetupModal: React.FC<GoogleSetupModalProps> = ({
                   className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
                 >
                   {copiedOrigin ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  {copiedOrigin ? 'Copied' : 'Copy origin'}
+                  {copiedOrigin ? 'Copied' : 'Copy URI'}
                 </button>
               </div>
             </div>
@@ -218,7 +218,7 @@ export const GoogleSetupModal: React.FC<GoogleSetupModalProps> = ({
                     />
                   </svg>
                   <span>
-                    {syncStatus.state === 'connecting' ? 'Authorizing...' : 'Sign in with Google'}
+                    {syncStatus.state === 'connecting' ? 'Redirecting...' : 'Sign in with Google'}
                   </span>
                 </button>
               ) : (
