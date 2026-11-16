@@ -1,0 +1,6 @@
+{
+  "name": "Cadence",
+  "description": "Installable PWA for study time tracking, time-blocking calendar planning, and task management with serverless Google Drive, Tasks, and Calendar sync.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
