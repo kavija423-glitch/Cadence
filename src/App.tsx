@@ -1046,6 +1046,16 @@ export default function App() {
             ],
           }))
         }
+        onUpdateSubjectColor={(subjId, color) =>
+          mutateDb((prev) => ({
+            ...prev,
+            subjects: prev.subjects.map((s) =>
+              s.id === subjId
+                ? { ...s, color, updatedAt: new Date().toISOString() }
+                : s
+            ),
+          }))
+        }
         onDeleteSubject={(subjId) =>
           mutateDb((prev) => {
             const remaining = prev.subjects.filter((s) => s.id !== subjId);
