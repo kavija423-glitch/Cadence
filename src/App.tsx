@@ -467,10 +467,12 @@ export default function App() {
 
   const handleSaveSession = (rating: 1 | 2 | 3 | 4 | 5, notes: string) => {
     const totalMs = computeElapsedMs(timer);
-    const durationSeconds = Math.max(60, Math.round(totalMs / 1000));
+    const durationSeconds = Math.max(1, Math.round(totalMs / 1000));
     const endedAt = new Date();
     const startedAt = new Date(endedAt.getTime() - durationSeconds * 1000);
-    const loggedMins = Math.max(1, Math.round(durationSeconds / 60));
+    const meetsOneMinute = totalMs >= 60_000;
+    const loggedMins = meetsOneMinute ? Math.max(1, Math.round(totalMs / 60_000)) : 0;
+    const sessionDateKey = toLocalDateKey(endedAt);
 
     const newSession: StudySession = {
       id: `sess-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -487,21 +489,43 @@ export default function App() {
     };
 
     mutateDb((prev) => {
+      const nowIso = new Date().toISOString();
       const nextTasks = { ...prev.tasks_metadata };
-      if (timer.taskId && nextTasks[timer.taskId]) {
+      if (loggedMins > 0 && timer.taskId && nextTasks[timer.taskId]) {
         nextTasks[timer.taskId] = {
           ...nextTasks[timer.taskId],
           logged_minutes: (nextTasks[timer.taskId].logged_minutes || 0) + loggedMins,
-          updatedAt: new Date().toISOString(),
+          updatedAt: nowIso,
         };
       }
-      const nextBlocks = timer.calendarBlockId
-        ? prev.calendar_blocks.map((b) =>
-            b.id === timer.calendarBlockId
-              ? { ...b, completed: true, updatedAt: new Date().toISOString() }
-              : b
-          )
-        : prev.calendar_blocks;
+
+      // Resolve target calendar block: explicit calendarBlockId first, else best matching block for timer.taskId
+      let targetBlockId = timer.calendarBlockId;
+      if (!targetBlockId && timer.taskId) {
+        const taskBlocks = prev.calendar_blocks.filter(
+          (b) => !b.deleted && b.taskId === timer.taskId
+        );
+        const todayMatch =
+          taskBlocks.find((b) => b.date === sessionDateKey && !b.completed) ||
+          taskBlocks.find((b) => b.date === sessionDateKey);
+        const fallbackMatch =
+          taskBlocks.find((b) => !b.completed) || taskBlocks[taskBlocks.length - 1];
+        targetBlockId = (todayMatch || fallbackMatch)?.id;
+      }
+
+      const nextBlocks =
+        targetBlockId && loggedMins > 0
+          ? prev.calendar_blocks.map((b) => {
+              if (b.id !== targetBlockId) return b;
+              const nextActual = (b.actualMinutes || 0) + loggedMins;
+              return {
+                ...b,
+                actualMinutes: nextActual,
+                completed: nextActual >= b.durationMinutes ? true : b.completed,
+                updatedAt: nowIso,
+              };
+            })
+          : prev.calendar_blocks;
 
       return {
         ...prev,

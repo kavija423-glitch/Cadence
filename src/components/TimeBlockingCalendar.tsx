@@ -40,6 +40,18 @@ const TOTAL_HOURS = END_HOUR - START_HOUR;
 const HOUR_HEIGHT = 60; // 60px per hour => 1px per minute, 15px per 15-min snap
 const CORE_DAY_START_HOUR = 6;
 
+function hexWithAlpha(hex: string, alphaHex: string): string {
+  const clean = hex.trim();
+  if (/^#[0-9a-f]{6}$/i.test(clean)) return `${clean}${alphaHex}`;
+  if (/^#[0-9a-f]{3}$/i.test(clean)) {
+    const r = clean[1];
+    const g = clean[2];
+    const b = clean[3];
+    return `#${r}${r}${g}${g}${b}${b}${alphaHex}`;
+  }
+  return `#2563EB${alphaHex}`;
+}
+
 interface TimeBlockingCalendarProps {
   weekStart: Date;
   onChangeWeekStart: (d: Date) => void;
@@ -407,75 +419,159 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
               ? resizingState.previewDuration
               : block.durationMinutes;
 
+          const plannedMinutes = Math.max(15, effectiveDuration);
+          const actualMinutes = Math.max(0, block.actualMinutes || 0);
+          const fillPercent = Math.min((actualMinutes / plannedMinutes) * 100, 100);
+          const overtimeMinutes = Math.max(0, actualMinutes - plannedMinutes);
+          const isTargetMet = actualMinutes > 0 && actualMinutes >= plannedMinutes;
+
+          const statusBadgeText =
+            actualMinutes > 0
+              ? isTargetMet
+                ? overtimeMinutes > 0
+                  ? `✓ ${actualMinutes}m (+${overtimeMinutes}m)`
+                  : `✓ ${actualMinutes}m`
+                : `${actualMinutes}m / ${plannedMinutes}m`
+              : null;
+
           const topPx = ((block.startMinutes - START_HOUR * 60) / 60) * HOUR_HEIGHT;
           const heightPx = Math.max(20, (effectiveDuration / 60) * HOUR_HEIGHT);
 
-          return (
-            <div
-              key={block.id}
-              data-calendar-block="true"
-              draggable
-              onDragStart={(e) => handleBlockDragStart(e, block)}
-              onClick={(e) => {
-                e.stopPropagation();
-                setSelectedBlock(block);
-              }}
-              style={{
-                top: `${topPx}px`,
-                height: `${heightPx}px`,
-                backgroundColor: `${color}14`,
-                borderColor: `${color}55`,
-              }}
-              className="group absolute left-1 right-1 z-20 rounded-lg border px-2 py-1 select-none cursor-pointer transition-shadow hover:shadow-sm overflow-hidden flex flex-col justify-between"
+          const maxExtraMinutes = Math.max(0, END_HOUR * 60 - (block.startMinutes + effectiveDuration));
+          const visibleOvertimeMinutes = Math.min(overtimeMinutes, maxExtraMinutes);
+          const overtimeHeightPx =
+            visibleOvertimeMinutes > 0
+              ? Math.max(12, (visibleOvertimeMinutes / 60) * HOUR_HEIGHT)
+              : 0;
+
+          const statusPillEl = statusBadgeText ? (
+            <span
+              className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] leading-none font-mono tabular-nums font-medium whitespace-nowrap shrink-0 border ${
+                isTargetMet
+                  ? 'bg-emerald-500/15 text-emerald-800 dark:text-emerald-200 border-emerald-500/35'
+                  : 'bg-white/85 dark:bg-slate-900/85 text-slate-700 dark:text-slate-200 border-slate-300/70 dark:border-slate-700'
+              }`}
             >
-              <div className="min-w-0">
-                <div className="flex items-center justify-between gap-1">
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    <span
-                      className="w-2 h-2 rounded-xs shrink-0"
-                      style={{ backgroundColor: color }}
-                    />
-                    <span
-                      className={`text-xs font-medium truncate text-slate-900 dark:text-slate-100 ${
-                        block.completed ? 'line-through opacity-60' : ''
-                      }`}
-                    >
-                      {block.title}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onStartTimerForBlock(block);
+              {statusBadgeText}
+            </span>
+          ) : null;
+
+          return (
+            <React.Fragment key={block.id}>
+              <div
+                data-calendar-block="true"
+                draggable
+                onDragStart={(e) => handleBlockDragStart(e, block)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSelectedBlock(block);
+                }}
+                style={{
+                  top: `${topPx}px`,
+                  height: `${heightPx}px`,
+                  backgroundColor: hexWithAlpha(color, '14'),
+                  borderColor: hexWithAlpha(color, '55'),
+                }}
+                className={`group absolute left-1 right-1 z-20 rounded-lg border px-2 ${
+                  heightPx < 30 ? 'py-0.5' : 'py-1'
+                } select-none cursor-pointer transition-shadow hover:shadow-sm overflow-hidden flex flex-col justify-between`}
+              >
+                {/* Ghost Progress Fill anchored to top */}
+                {actualMinutes > 0 && (
+                  <div
+                    aria-hidden="true"
+                    style={{
+                      height: `${fillPercent}%`,
+                      backgroundColor: hexWithAlpha(color, '38'),
+                      borderBottom:
+                        fillPercent > 0 && fillPercent < 100
+                          ? `1px solid ${hexWithAlpha(color, '70')}`
+                          : undefined,
                     }}
-                    className="opacity-0 group-hover:opacity-100 focus:opacity-100 shrink-0 p-1 rounded-md bg-white/80 dark:bg-slate-900/80 text-blue-600 dark:text-blue-400 hover:bg-white transition-opacity cursor-pointer"
-                    title="Start focus timer"
-                    aria-label={`Start timer for ${block.title}`}
-                  >
-                    <Play className="w-3 h-3" />
-                  </button>
+                    className="pointer-events-none absolute top-0 left-0 right-0 transition-[height] duration-300"
+                  />
+                )}
+
+                <div className="relative z-10 min-w-0">
+                  <div className="flex items-center justify-between gap-1">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span
+                        className="w-2 h-2 rounded-xs shrink-0"
+                        style={{ backgroundColor: color }}
+                      />
+                      <span
+                        className={`text-xs font-medium truncate text-slate-900 dark:text-slate-100 ${
+                          block.completed ? 'line-through opacity-60' : ''
+                        }`}
+                      >
+                        {block.title}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-1 shrink-0">
+                      {statusPillEl && heightPx < 58 && statusPillEl}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onStartTimerForBlock(block);
+                        }}
+                        className="opacity-0 group-hover:opacity-100 focus:opacity-100 shrink-0 p-1 rounded-md bg-white/80 dark:bg-slate-900/80 text-blue-600 dark:text-blue-400 hover:bg-white transition-opacity cursor-pointer"
+                        title="Start focus timer"
+                        aria-label={`Start timer for ${block.title}`}
+                      >
+                        <Play className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {heightPx >= 38 && (
+                    <div className="mt-0.5 text-[10px] font-mono tabular-nums text-slate-600 dark:text-slate-400 truncate">
+                      {formatMinutesAsClock(block.startMinutes)}–
+                      {formatMinutesAsClock(block.startMinutes + effectiveDuration)} ·{' '}
+                      {formatDurationCompact(effectiveDuration)}
+                    </div>
+                  )}
+
+                  {statusPillEl && heightPx >= 58 && (
+                    <div className="mt-1 flex items-center">{statusPillEl}</div>
+                  )}
                 </div>
 
-                {heightPx >= 38 && (
-                  <div className="mt-0.5 text-[10px] font-mono tabular-nums text-slate-600 dark:text-slate-400 truncate">
-                    {formatMinutesAsClock(block.startMinutes)}–
-                    {formatMinutesAsClock(block.startMinutes + effectiveDuration)} ·{' '}
-                    {formatDurationCompact(effectiveDuration)}
-                  </div>
-                )}
+                {/* Bottom-edge resize handle */}
+                <div
+                  onPointerDown={(e) => handleResizeStart(e, block)}
+                  onClick={(e) => e.stopPropagation()}
+                  title="Drag to resize duration"
+                  className="absolute inset-x-0 bottom-0 z-20 h-2.5 cursor-ns-resize flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                >
+                  <span className="w-7 h-0.5 rounded-full bg-slate-400/70 dark:bg-slate-500/70" />
+                </div>
               </div>
 
-              {/* Bottom-edge resize handle */}
-              <div
-                onPointerDown={(e) => handleResizeStart(e, block)}
-                onClick={(e) => e.stopPropagation()}
-                title="Drag to resize duration"
-                className="absolute inset-x-0 bottom-0 h-2.5 cursor-ns-resize flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-              >
-                <span className="w-7 h-0.5 rounded-full bg-slate-400/70 dark:bg-slate-500/70" />
-              </div>
-            </div>
+              {/* Subtle dashed overtime extension below planned block height */}
+              {overtimeHeightPx > 0 && (
+                <div
+                  aria-hidden="true"
+                  style={{
+                    top: `${topPx + heightPx - 1}px`,
+                    height: `${overtimeHeightPx + 1}px`,
+                    backgroundColor: hexWithAlpha(color, '1C'),
+                    borderColor: hexWithAlpha(color, '70'),
+                  }}
+                  className="pointer-events-none absolute left-1 right-1 z-10 rounded-b-lg border border-t-0 border-dashed flex items-end justify-end px-2 py-0.5"
+                >
+                  {overtimeHeightPx >= 16 && (
+                    <span
+                      className="text-[10px] font-mono tabular-nums font-medium"
+                      style={{ color }}
+                    >
+                      +{overtimeMinutes}m over
+                    </span>
+                  )}
+                </div>
+              )}
+            </React.Fragment>
           );
         })}
 
@@ -861,7 +957,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
 
             <div className="space-y-2">
               <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">
-                Adjust Duration
+                Planned Duration
               </label>
               <div className="flex items-center gap-2">
                 <button
@@ -894,6 +990,88 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
                 </button>
               </div>
             </div>
+
+            {/* Manual Actual Focused Minutes Editor */}
+            {(() => {
+              const modalActual = Math.max(0, selectedBlock.actualMinutes || 0);
+              const modalPlanned = Math.max(15, selectedBlock.durationMinutes);
+              const modalPct = Math.min(100, Math.round((modalActual / modalPlanned) * 100));
+              const modalColor = subjectMap.get(selectedBlock.subjectId)?.color || '#2563EB';
+              const applyActual = (nextVal: number) => {
+                const clamped = Math.max(0, Math.min(720, Math.round(nextVal)));
+                const nextCompleted =
+                  clamped >= selectedBlock.durationMinutes
+                    ? true
+                    : selectedBlock.completed && clamped < selectedBlock.durationMinutes
+                    ? false
+                    : selectedBlock.completed;
+                onUpdateBlock(selectedBlock.id, {
+                  actualMinutes: clamped,
+                  completed: nextCompleted,
+                });
+                setSelectedBlock({
+                  ...selectedBlock,
+                  actualMinutes: clamped,
+                  completed: nextCompleted,
+                });
+              };
+              return (
+                <div className="space-y-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/50 p-3">
+                  <div className="flex items-center justify-between text-xs">
+                    <label
+                      htmlFor="block-actual-minutes"
+                      className="font-medium text-slate-700 dark:text-slate-300"
+                    >
+                      Actual Focused Time
+                    </label>
+                    <span className="font-mono tabular-nums text-slate-500 dark:text-slate-400">
+                      {modalActual >= modalPlanned
+                        ? `✓ ${modalActual}m${modalActual > modalPlanned ? ` (+${modalActual - modalPlanned}m)` : ''}`
+                        : `${modalActual}m / ${modalPlanned}m`}
+                    </span>
+                  </div>
+
+                  <div className="h-1.5 w-full rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+                    <div
+                      className="h-full rounded-full transition-all duration-200"
+                      style={{ width: `${modalPct}%`, backgroundColor: modalColor }}
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => applyActual(modalActual - 5)}
+                      className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-mono font-medium hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer"
+                    >
+                      -5m
+                    </button>
+                    <div className="relative flex-1">
+                      <input
+                        id="block-actual-minutes"
+                        type="number"
+                        min={0}
+                        max={720}
+                        step={1}
+                        value={modalActual}
+                        onChange={(e) => applyActual(Number(e.target.value) || 0)}
+                        className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 pr-8 text-center text-xs font-mono tabular-nums font-semibold text-slate-900 dark:text-slate-100"
+                      />
+                      <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] font-mono text-slate-400">
+                        m
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => applyActual(modalActual + 5)}
+                      className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-xs font-mono font-medium hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer"
+                    >
+                      +5m
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
 
             <div className="flex flex-wrap items-center gap-2 pt-2">
               <button

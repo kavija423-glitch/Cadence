@@ -48,7 +48,8 @@ export interface CalendarBlock {
   title: string;
   date: string; // YYYY-MM-DD
   startMinutes: number; // 0..1440
-  durationMinutes: number; // multiple of 15
+  durationMinutes: number; // plannedMinutes (multiple of 15)
+  actualMinutes?: number; // accumulated focused minutes
   completed?: boolean;
   updatedAt: string;
   deleted?: boolean;

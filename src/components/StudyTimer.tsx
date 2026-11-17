@@ -462,7 +462,8 @@ export const SessionCompleteModal: React.FC<{
 
   if (!isOpen) return null;
 
-  const mins = Math.max(1, Math.round(durationSeconds / 60));
+  const mins = Math.round(durationSeconds / 60);
+  const minsLabel = durationSeconds < 60 ? '< 1 min' : `${mins} min`;
 
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/60 backdrop-blur-xs p-0 sm:p-4">
@@ -475,7 +476,7 @@ export const SessionCompleteModal: React.FC<{
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
               {title} · {subjectName} ·{' '}
               <span className="font-mono tabular-nums font-medium text-blue-600 dark:text-blue-400">
-                {mins} min ({formatSecondsHMS(durationSeconds)})
+                {minsLabel} ({formatSecondsHMS(durationSeconds)})
               </span>
             </p>
           </div>
