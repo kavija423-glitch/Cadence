@@ -7,8 +7,9 @@ import {
   RefreshCw,
   Sun,
   Moon,
-  Cloud,
-  CloudOff,
+  Settings,
+  AlertCircle,
+  X,
 } from 'lucide-react';
 import type {
   ActiveTimerSnapshot,
@@ -34,17 +35,21 @@ import { computeNextDueDate, normalizeRepeatRule } from './utils/recurrence';
 import { createEmptyDatabase } from './utils/seedData';
 import { playCompletionChime } from './utils/sound';
 import {
+  GoogleAuthInteractionRequiredError,
   clearAccessToken,
+  ensureValidGoogleToken,
   fetchGoogleCalendarOverlay,
-  fetchUserCalendarEmail,
+  fetchGoogleUserProfile,
   getAccessToken,
   getSavedClientId,
+  getStoredUserProfile,
   hasValidAccessToken,
   overwriteDriveSyncFile,
   parseOAuthCallbackFromHash,
   performFullGoogleSync,
-  redirectToGoogleOAuth,
+  requestInteractiveGoogleToken,
   saveClientId,
+  silentRefreshGoogleToken,
 } from './services/googleSync';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
@@ -125,13 +130,19 @@ export default function App() {
   const [showSetupModal, setShowSetupModal] = useState(false);
   const [clientId, setClientId] = useState<string>(() => getSavedClientId());
   const [isGoogleConnected, setIsGoogleConnected] = useState<boolean>(() => hasValidAccessToken());
+  const [dismissedReconnectBanner, setDismissedReconnectBanner] = useState(false);
   const [googleEvents, setGoogleEvents] = useState<GoogleCalendarEventOverlay[]>([]);
-  const [syncStatus, setSyncStatus] = useState<SyncStatusInfo>({
-    state: 'local',
-    lastSyncedAt: null,
-    remoteFileId: null,
-    remoteModifiedTime: null,
-    userEmail: null,
+  const [syncStatus, setSyncStatus] = useState<SyncStatusInfo>(() => {
+    const profile = getStoredUserProfile();
+    return {
+      state: 'local',
+      lastSyncedAt: null,
+      remoteFileId: null,
+      remoteModifiedTime: null,
+      userEmail: profile.email,
+      userName: profile.name,
+      needsReconnect: false,
+    };
   });
 
   const dirtyRef = useRef(false);
@@ -140,6 +151,8 @@ export default function App() {
   dbRef.current = db;
   const syncStatusRef = useRef(syncStatus);
   syncStatusRef.current = syncStatus;
+  const isGoogleConnectedRef = useRef(isGoogleConnected);
+  isGoogleConnectedRef.current = isGoogleConnected;
 
   // Apply light/dark theme to <html>
   useEffect(() => {
@@ -165,11 +178,9 @@ export default function App() {
     }
   }, [timer]);
 
-  // Sync trigger helper
+  // Sync trigger helper with transparent silent refresh fallback
   const runSync = useCallback(
     async (explicitToken?: string) => {
-      const token = explicitToken || getAccessToken();
-      if (!token) return;
       if (!navigator.onLine) {
         setSyncStatus((prev) => ({ ...prev, state: 'offline' }));
         return;
@@ -177,6 +188,15 @@ export default function App() {
 
       setSyncStatus((prev) => ({ ...prev, state: 'syncing', errorMessage: undefined }));
       try {
+        let token = explicitToken || getAccessToken();
+        if (!token) {
+          token = await ensureValidGoogleToken();
+        }
+        if (!token) {
+          setSyncStatus((prev) => ({ ...prev, state: 'local' }));
+          return;
+        }
+
         const weekEnd = addDays(weekStart, 6);
         const result = await performFullGoogleSync({
           token,
@@ -188,7 +208,10 @@ export default function App() {
           weekEnd,
         });
 
+        const profile = getStoredUserProfile();
         dirtyRef.current = false;
+        setIsGoogleConnected(true);
+        setDismissedReconnectBanner(false);
         setDb(result.mergedDb);
         setGoogleEvents(result.calendarEvents);
         setSyncStatus((prev) => ({
@@ -197,13 +220,26 @@ export default function App() {
           lastSyncedAt: new Date().toISOString(),
           remoteFileId: result.remoteFileId,
           remoteModifiedTime: result.remoteModifiedTime,
+          userEmail: profile.email || prev.userEmail,
+          userName: profile.name || prev.userName,
+          needsReconnect: false,
+          reconnectReason: undefined,
           errorMessage: undefined,
         }));
       } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Google sync failed.';
-        if (msg.toLowerCase().includes('expired')) {
+        if (err instanceof GoogleAuthInteractionRequiredError) {
           setIsGoogleConnected(false);
+          setDismissedReconnectBanner(false);
+          setSyncStatus((prev) => ({
+            ...prev,
+            state: 'local',
+            needsReconnect: true,
+            reconnectReason: err.code,
+            errorMessage: undefined,
+          }));
+          return;
         }
+        const msg = err instanceof Error ? err.message : 'Google sync failed.';
         setSyncStatus((prev) => ({
           ...prev,
           state: 'error',
@@ -231,7 +267,13 @@ export default function App() {
         debounceTimerRef.current = null;
       }
 
-      if (hasValidAccessToken()) {
+      const canAttemptSync =
+        hasValidAccessToken() ||
+        (isGoogleConnectedRef.current &&
+          !syncStatusRef.current.needsReconnect &&
+          !!getStoredUserProfile().email);
+
+      if (canAttemptSync) {
         if (syncImmediately) {
           setTimeout(() => void runSync(), 100);
         } else {
@@ -246,17 +288,39 @@ export default function App() {
 
   // Refresh Google Calendar overlay when switching weeks while connected
   useEffect(() => {
-    const token = getAccessToken();
-    if (!isGoogleConnected || !token) return;
+    if (!isGoogleConnected || !navigator.onLine) return;
+    let cancelled = false;
     const weekEnd = addDays(weekStart, 6);
-    fetchGoogleCalendarOverlay(token, weekStart, weekEnd)
-      .then((evs) => setGoogleEvents(evs))
-      .catch(() => {
-        // Handled on next full sync
-      });
+
+    void (async () => {
+      try {
+        const token = await ensureValidGoogleToken();
+        if (!token || cancelled) return;
+        const evs = await fetchGoogleCalendarOverlay(token, weekStart, weekEnd);
+        if (!cancelled) {
+          setGoogleEvents(evs);
+        }
+      } catch (err) {
+        if (cancelled) return;
+        if (err instanceof GoogleAuthInteractionRequiredError) {
+          setIsGoogleConnected(false);
+          setDismissedReconnectBanner(false);
+          setSyncStatus((prev) => ({
+            ...prev,
+            state: 'local',
+            needsReconnect: true,
+            reconnectReason: err.code,
+          }));
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [weekStart, isGoogleConnected]);
 
-  // Parse OAuth 2.0 implicit flow access_token from window.location.hash on page load
+  // Boot session restoration & silent re-authentication (prompt: 'none')
   useEffect(() => {
     const { accessToken, error } = parseOAuthCallbackFromHash();
     if (error) {
@@ -272,24 +336,109 @@ export default function App() {
     if (accessToken) {
       setIsGoogleConnected(true);
       void (async () => {
-        const email = await fetchUserCalendarEmail(accessToken);
-        setSyncStatus((prev) => ({ ...prev, userEmail: email }));
+        const profile = await fetchGoogleUserProfile(accessToken);
+        setSyncStatus((prev) => ({
+          ...prev,
+          userEmail: profile.email || prev.userEmail,
+          userName: profile.name || prev.userName,
+          needsReconnect: false,
+          reconnectReason: undefined,
+        }));
         await runSync(accessToken);
       })();
+      return;
     }
-    // Run once on initial mount to handle OAuth redirect callback
+
+    const validToken = getAccessToken();
+    const savedProfile = getStoredUserProfile();
+    const savedClientId = getSavedClientId();
+
+    if (validToken) {
+      // Restored immediately within the 1-hour validity window with zero login clicks
+      setIsGoogleConnected(true);
+      void (async () => {
+        if (!savedProfile.email) {
+          const profile = await fetchGoogleUserProfile(validToken);
+          setSyncStatus((prev) => ({
+            ...prev,
+            userEmail: profile.email || prev.userEmail,
+            userName: profile.name || prev.userName,
+          }));
+        }
+        if (navigator.onLine) {
+          await runSync(validToken);
+        }
+      })();
+      return;
+    }
+
+    if (savedProfile.email && savedClientId) {
+      if (!navigator.onLine) {
+        setSyncStatus((prev) => ({ ...prev, state: 'offline' }));
+        return;
+      }
+
+      void (async () => {
+        try {
+          const freshToken = await silentRefreshGoogleToken(savedClientId, savedProfile.email!);
+          const updatedProfile = getStoredUserProfile();
+          setIsGoogleConnected(true);
+          setDismissedReconnectBanner(false);
+          setSyncStatus((prev) => ({
+            ...prev,
+            userEmail: updatedProfile.email || prev.userEmail,
+            userName: updatedProfile.name || prev.userName,
+            needsReconnect: false,
+            reconnectReason: undefined,
+            errorMessage: undefined,
+          }));
+          await runSync(freshToken);
+        } catch (err) {
+          if (err instanceof GoogleAuthInteractionRequiredError) {
+            setIsGoogleConnected(false);
+            setDismissedReconnectBanner(false);
+            setSyncStatus((prev) => ({
+              ...prev,
+              state: 'local',
+              needsReconnect: true,
+              reconnectReason: err.code,
+              errorMessage: undefined,
+            }));
+          }
+        }
+      })();
+    }
+    // Run once on initial mount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Connect via full-page Google OAuth 2.0 implicit redirect flow
-  const handleGoogleConnect = async () => {
-    if (!clientId.trim()) {
+  // Connect / Reconnect via GIS initTokenClient popup flow
+  const handleGoogleConnect = async (clientIdOverride?: string) => {
+    const resolvedClientId = (clientIdOverride ?? clientId ?? getSavedClientId()).trim();
+    if (!resolvedClientId) {
       setShowSetupModal(true);
       return;
     }
+
     setSyncStatus((prev) => ({ ...prev, state: 'connecting', errorMessage: undefined }));
     try {
-      redirectToGoogleOAuth(clientId);
+      const savedProfile = getStoredUserProfile();
+      const result = await requestInteractiveGoogleToken(resolvedClientId, {
+        hint: syncStatusRef.current.userEmail || savedProfile.email || undefined,
+        prompt: syncStatusRef.current.reconnectReason === 'consent_required' ? 'consent' : undefined,
+      });
+
+      setIsGoogleConnected(true);
+      setDismissedReconnectBanner(false);
+      setSyncStatus((prev) => ({
+        ...prev,
+        userEmail: result.email || prev.userEmail,
+        userName: result.name || prev.userName,
+        needsReconnect: false,
+        reconnectReason: undefined,
+        errorMessage: undefined,
+      }));
+      await runSync(result.accessToken);
     } catch (err) {
       setSyncStatus((prev) => ({
         ...prev,
@@ -302,6 +451,7 @@ export default function App() {
   const handleGoogleDisconnect = () => {
     clearAccessToken();
     setIsGoogleConnected(false);
+    setDismissedReconnectBanner(false);
     setGoogleEvents([]);
     setSyncStatus({
       state: 'local',
@@ -309,6 +459,9 @@ export default function App() {
       remoteFileId: null,
       remoteModifiedTime: null,
       userEmail: null,
+      userName: null,
+      needsReconnect: false,
+      reconnectReason: undefined,
     });
   };
 
@@ -751,7 +904,9 @@ export default function App() {
     ? 'Syncing...'
     : isGoogleConnected
     ? `Synced · ${formatRelativeTime(syncStatus.lastSyncedAt)}`
-    : 'Google Sync';
+    : syncStatus.needsReconnect
+    ? 'Reconnect Google'
+    : 'Preferences';
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
@@ -839,14 +994,16 @@ export default function App() {
             className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
               isGoogleConnected
                 ? 'border border-emerald-200 dark:border-emerald-800 bg-emerald-50/70 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300'
+                : syncStatus.needsReconnect
+                ? 'border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200 hover:bg-amber-100 dark:hover:bg-amber-900/50'
                 : 'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 hover:opacity-90'
             }`}
           >
-            {isGoogleConnected ? (
-              <Cloud className="w-3.5 h-3.5 shrink-0" />
-            ) : (
-              <CloudOff className="w-3.5 h-3.5 shrink-0 opacity-80" />
-            )}
+            <Settings
+              className={`w-3.5 h-3.5 shrink-0 ${
+                isGoogleConnected ? '' : 'opacity-80'
+              }`}
+            />
             <span>{syncLabel}</span>
           </button>
         </div>
@@ -854,6 +1011,36 @@ export default function App() {
 
       {/* MAIN VIEWPORT */}
       <main className="flex-1 pb-28 md:pb-14">
+        {syncStatus.needsReconnect && !isGoogleConnected && !dismissedReconnectBanner && (
+          <div className="mx-auto max-w-[1600px] px-4 sm:px-6 pt-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 dark:border-amber-900/60 bg-amber-50/90 dark:bg-amber-950/35 px-3.5 py-2 text-xs text-amber-900 dark:text-amber-200">
+              <div className="flex items-center gap-2 min-w-0">
+                <AlertCircle className="w-4 h-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                <span className="truncate">
+                  Google session expired{syncStatus.userEmail ? ` (${syncStatus.userEmail})` : ''}. Your locally cached tasks and calendar remain available.
+                </span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0 ml-auto">
+                <button
+                  type="button"
+                  onClick={() => void handleGoogleConnect()}
+                  disabled={syncStatus.state === 'connecting'}
+                  className="rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-60 px-2.5 py-1 text-xs font-medium text-white transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  {syncStatus.state === 'connecting' ? 'Connecting...' : 'Reconnect Google'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDismissedReconnectBanner(true)}
+                  className="p-1 rounded-md text-amber-700/70 hover:text-amber-900 dark:text-amber-300/70 dark:hover:text-amber-100 cursor-pointer"
+                  aria-label="Dismiss reconnect notice"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         {activeTab === 'workspace' && (
           <TimeBlockingCalendar
             weekStart={weekStart}
@@ -1130,30 +1317,48 @@ export default function App() {
             // Ignore storage errors
           }
 
-          const token = getAccessToken();
-          if (token && navigator.onLine) {
+          if (navigator.onLine && (isGoogleConnected || (getStoredUserProfile().email && !syncStatusRef.current.needsReconnect))) {
             setSyncStatus((prev) => ({ ...prev, state: 'syncing', errorMessage: undefined }));
             try {
-              const saved = await overwriteDriveSyncFile({
-                token,
-                emptyDb,
-                knownRemoteFileId: syncStatusRef.current.remoteFileId,
-              });
-              setSyncStatus((prev) => ({
-                ...prev,
-                state: 'synced',
-                lastSyncedAt: new Date().toISOString(),
-                remoteFileId: saved.remoteFileId,
-                remoteModifiedTime: saved.remoteModifiedTime,
-                errorMessage: undefined,
-              }));
+              const token = await ensureValidGoogleToken();
+              if (token) {
+                const saved = await overwriteDriveSyncFile({
+                  token,
+                  emptyDb,
+                  knownRemoteFileId: syncStatusRef.current.remoteFileId,
+                });
+                setSyncStatus((prev) => ({
+                  ...prev,
+                  state: 'synced',
+                  lastSyncedAt: new Date().toISOString(),
+                  remoteFileId: saved.remoteFileId,
+                  remoteModifiedTime: saved.remoteModifiedTime,
+                  needsReconnect: false,
+                  reconnectReason: undefined,
+                  errorMessage: undefined,
+                }));
+              } else {
+                setSyncStatus((prev) => ({ ...prev, state: 'local' }));
+              }
             } catch (err) {
-              setSyncStatus((prev) => ({
-                ...prev,
-                state: 'error',
-                errorMessage:
-                  err instanceof Error ? err.message : 'Failed to overwrite study_sync.json.',
-              }));
+              if (err instanceof GoogleAuthInteractionRequiredError) {
+                setIsGoogleConnected(false);
+                setDismissedReconnectBanner(false);
+                setSyncStatus((prev) => ({
+                  ...prev,
+                  state: 'local',
+                  needsReconnect: true,
+                  reconnectReason: err.code,
+                  errorMessage: undefined,
+                }));
+              } else {
+                setSyncStatus((prev) => ({
+                  ...prev,
+                  state: 'error',
+                  errorMessage:
+                    err instanceof Error ? err.message : 'Failed to overwrite study_sync.json.',
+                }));
+              }
             }
           }
         }}

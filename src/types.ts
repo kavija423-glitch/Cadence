@@ -128,6 +128,9 @@ export interface SyncStatusInfo {
   remoteFileId: string | null;
   remoteModifiedTime: string | null;
   userEmail: string | null;
+  userName?: string | null;
+  needsReconnect?: boolean;
+  reconnectReason?: string;
   errorMessage?: string;
 }
 

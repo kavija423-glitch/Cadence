@@ -13,15 +13,73 @@ export const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/drive.appdata',
   'https://www.googleapis.com/auth/tasks',
   'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile',
 ];
 
 const CLIENT_ID_STORAGE_KEY = 'cadence_google_client_id';
+const GOOGLE_SESSION_STORAGE_KEY = 'cadence_google_session_v1';
 const OAUTH_STATE_STORAGE_KEY = 'cadence_oauth_state';
 const SYNC_FILENAME = 'study_sync.json';
+const EXPIRY_BUFFER_MS = 60_000;
 
-// Strict in-memory token cache (never stored in localStorage)
-let cachedAccessToken: string | null = null;
-let tokenExpiresAtMs = 0;
+export interface StoredGoogleSession {
+  access_token: string;
+  expires_at: number;
+  email?: string;
+  name?: string;
+}
+
+interface GisTokenResponse {
+  access_token?: string;
+  expires_in?: number | string;
+  scope?: string;
+  token_type?: string;
+  error?: string;
+  error_description?: string;
+}
+
+interface GisTokenClientError {
+  type?: string;
+  message?: string;
+}
+
+interface GisTokenClient {
+  requestAccessToken: (overrideConfig?: {
+    prompt?: string;
+    hint?: string;
+    scope?: string;
+  }) => void;
+}
+
+declare global {
+  interface Window {
+    google?: {
+      accounts?: {
+        oauth2?: {
+          initTokenClient: (config: {
+            client_id: string;
+            scope: string;
+            hint?: string;
+            prompt?: string;
+            callback: (response: GisTokenResponse) => void;
+            error_callback?: (error: GisTokenClientError) => void;
+          }) => GisTokenClient;
+        };
+      };
+    };
+  }
+}
+
+export class GoogleAuthInteractionRequiredError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message?: string) {
+    super(message || 'Google session expired. Please reconnect.');
+    this.name = 'GoogleAuthInteractionRequiredError';
+    this.code = code;
+  }
+}
 
 export function getSavedClientId(): string {
   try {
@@ -44,18 +102,80 @@ export function saveClientId(clientId: string): void {
   }
 }
 
+export function getStoredGoogleSession(): StoredGoogleSession | null {
+  try {
+    const raw = localStorage.getItem(GOOGLE_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as StoredGoogleSession;
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredGoogleSession(session: StoredGoogleSession): void {
+  try {
+    localStorage.setItem(GOOGLE_SESSION_STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function computeExpiresAtMs(expiresIn: number | string | undefined): number {
+  const sec = typeof expiresIn === 'string' ? parseInt(expiresIn, 10) : Number(expiresIn);
+  const validSec = Number.isFinite(sec) && sec > 0 ? sec : 3600;
+  return Date.now() + validSec * 1000 - EXPIRY_BUFFER_MS;
+}
+
+export function markStoredTokenExpired(): void {
+  const existing = getStoredGoogleSession();
+  if (!existing) return;
+  if (existing.email || existing.name) {
+    saveStoredGoogleSession({
+      access_token: '',
+      expires_at: 0,
+      email: existing.email,
+      name: existing.name,
+    });
+  } else {
+    try {
+      localStorage.removeItem(GOOGLE_SESSION_STORAGE_KEY);
+    } catch {
+      // Ignore
+    }
+  }
+}
+
 export function hasValidAccessToken(): boolean {
-  return !!cachedAccessToken && Date.now() < tokenExpiresAtMs - 30_000;
+  const session = getStoredGoogleSession();
+  return !!(session?.access_token && Date.now() < session.expires_at);
 }
 
 export function getAccessToken(): string | null {
-  return hasValidAccessToken() ? cachedAccessToken : null;
+  const session = getStoredGoogleSession();
+  if (session?.access_token && Date.now() < session.expires_at) {
+    return session.access_token;
+  }
+  return null;
+}
+
+export function getStoredUserProfile(): { email: string | null; name: string | null } {
+  const session = getStoredGoogleSession();
+  return {
+    email: session?.email || null,
+    name: session?.name || null,
+  };
 }
 
 export function clearAccessToken(): void {
-  const token = cachedAccessToken;
-  cachedAccessToken = null;
-  tokenExpiresAtMs = 0;
+  const session = getStoredGoogleSession();
+  const token = session?.access_token;
+  try {
+    localStorage.removeItem(GOOGLE_SESSION_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors
+  }
   if (token) {
     fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, {
       method: 'POST',
@@ -65,34 +185,293 @@ export function clearAccessToken(): void {
   }
 }
 
-export function redirectToGoogleOAuth(clientId: string): void {
+export async function fetchGoogleUserProfile(token: string): Promise<{
+  email: string | null;
+  name: string | null;
+}> {
+  try {
+    const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { email?: string; name?: string };
+      if (data.email || data.name) {
+        return {
+          email: data.email || null,
+          name: data.name || null,
+        };
+      }
+    }
+  } catch {
+    // Fallback to calendar primary email below
+  }
+
+  const calEmail = await fetchUserCalendarEmail(token);
+  return { email: calEmail, name: null };
+}
+
+export async function fetchUserCalendarEmail(token: string): Promise<string | null> {
+  try {
+    const res = await fetch(
+      'https://www.googleapis.com/calendar/v3/calendars/primary?fields=id,summary',
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as { id?: string; summary?: string };
+    return data.id || data.summary || null;
+  } catch {
+    return null;
+  }
+}
+
+async function persistTokenAndProfile(response: GisTokenResponse): Promise<{
+  accessToken: string;
+  expiresAt: number;
+  email: string | null;
+  name: string | null;
+}> {
+  const accessToken = response.access_token || '';
+  const expiresAt = computeExpiresAtMs(response.expires_in);
+  const existing = getStoredGoogleSession();
+
+  // Save token immediately so concurrent calls can read it even before UserInfo resolves
+  saveStoredGoogleSession({
+    access_token: accessToken,
+    expires_at: expiresAt,
+    email: existing?.email,
+    name: existing?.name,
+  });
+
+  const fetched = await fetchGoogleUserProfile(accessToken);
+  const email = fetched.email || existing?.email || null;
+  const name = fetched.name || existing?.name || null;
+
+  saveStoredGoogleSession({
+    access_token: accessToken,
+    expires_at: expiresAt,
+    email: email || undefined,
+    name: name || undefined,
+  });
+
+  return { accessToken, expiresAt, email, name };
+}
+
+async function ensureGsiLoaded(timeoutMs = 10_000): Promise<void> {
+  if (typeof window === 'undefined') {
+    throw new Error('Google Identity Services requires a browser environment.');
+  }
+  if (window.google?.accounts?.oauth2?.initTokenClient) {
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const start = Date.now();
+    let script = document.querySelector<HTMLScriptElement>(
+      'script[src*="accounts.google.com/gsi/client"]'
+    );
+    if (!script) {
+      script = document.createElement('script');
+      script.src = 'https://accounts.google.com/gsi/client';
+      script.async = true;
+      script.defer = true;
+      document.head.appendChild(script);
+    }
+
+    const checkInterval = window.setInterval(() => {
+      if (window.google?.accounts?.oauth2?.initTokenClient) {
+        window.clearInterval(checkInterval);
+        resolve();
+        return;
+      }
+      if (Date.now() - start >= timeoutMs) {
+        window.clearInterval(checkInterval);
+        reject(new Error('Google Identity Services failed to load. Check your network connection.'));
+      }
+    }, 50);
+
+    script.addEventListener(
+      'error',
+      () => {
+        window.clearInterval(checkInterval);
+        reject(new Error('Could not load Google Identity Services script.'));
+      },
+      { once: true }
+    );
+  });
+}
+
+let inFlightSilentRefresh: Promise<string> | null = null;
+
+export async function silentRefreshGoogleToken(
+  explicitClientId?: string,
+  explicitHint?: string
+): Promise<string> {
+  if (inFlightSilentRefresh) {
+    return inFlightSilentRefresh;
+  }
+
+  const resolvedClientId = (explicitClientId || getSavedClientId()).trim();
+  const savedProfile = getStoredUserProfile();
+  const resolvedHint = explicitHint || savedProfile.email || undefined;
+
+  if (!resolvedClientId) {
+    throw new GoogleAuthInteractionRequiredError(
+      'missing_client_id',
+      'Google OAuth Client ID is not configured.'
+    );
+  }
+
+  inFlightSilentRefresh = (async () => {
+    await ensureGsiLoaded();
+
+    return await new Promise<string>((resolve, reject) => {
+      let settled = false;
+      const timer = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        markStoredTokenExpired();
+        reject(
+          new GoogleAuthInteractionRequiredError(
+            'interaction_required',
+            'Silent Google refresh timed out. Please reconnect Google.'
+          )
+        );
+      }, 12_000);
+
+      const finishReject = (code: string, msg?: string) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        markStoredTokenExpired();
+        reject(new GoogleAuthInteractionRequiredError(code, msg));
+      };
+
+      try {
+        const tokenClient = window.google!.accounts!.oauth2!.initTokenClient({
+          client_id: resolvedClientId,
+          scope: GOOGLE_SCOPES.join(' '),
+          hint: resolvedHint,
+          callback: (response) => {
+            if (settled) return;
+            if (response.error || !response.access_token) {
+              const errCode = response.error || 'interaction_required';
+              finishReject(
+                errCode,
+                response.error_description || 'Silent Google sign-in requires user interaction.'
+              );
+              return;
+            }
+            settled = true;
+            window.clearTimeout(timer);
+            void persistTokenAndProfile(response)
+              .then((saved) => resolve(saved.accessToken))
+              .catch(() => resolve(response.access_token!));
+          },
+          error_callback: (err) => {
+            finishReject(
+              err.type || 'interaction_required',
+              err.message || 'Silent Google sign-in could not complete.'
+            );
+          },
+        });
+
+        tokenClient.requestAccessToken({
+          prompt: 'none',
+          hint: resolvedHint,
+        });
+      } catch (err) {
+        finishReject(
+          'interaction_required',
+          err instanceof Error ? err.message : 'Silent Google refresh failed.'
+        );
+      }
+    });
+  })().finally(() => {
+    inFlightSilentRefresh = null;
+  });
+
+  return inFlightSilentRefresh;
+}
+
+export async function requestInteractiveGoogleToken(
+  clientId: string,
+  options?: { hint?: string; prompt?: '' | 'consent' | 'select_account' }
+): Promise<{
+  accessToken: string;
+  expiresAt: number;
+  email: string | null;
+  name: string | null;
+}> {
   const trimmedId = clientId.trim();
   if (!trimmedId) {
     throw new Error('Please paste your Google OAuth Client ID first.');
   }
 
-  const state =
-    typeof crypto !== 'undefined' && crypto.randomUUID
-      ? crypto.randomUUID()
-      : Math.random().toString(36).slice(2) + Date.now().toString(36);
+  await ensureGsiLoaded();
+  const savedProfile = getStoredUserProfile();
+  const hint = options?.hint || savedProfile.email || undefined;
+  const prompt = options?.prompt !== undefined ? options.prompt : hint ? '' : 'select_account';
 
-  try {
-    sessionStorage.setItem(OAUTH_STATE_STORAGE_KEY, state);
-  } catch {
-    // Ignore sessionStorage restrictions
-  }
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    try {
+      const tokenClient = window.google!.accounts!.oauth2!.initTokenClient({
+        client_id: trimmedId,
+        scope: GOOGLE_SCOPES.join(' '),
+        hint,
+        callback: (response) => {
+          if (settled) return;
+          settled = true;
+          if (response.error || !response.access_token) {
+            reject(
+              new Error(
+                response.error_description ||
+                  response.error ||
+                  'Google authorization was not completed.'
+              )
+            );
+            return;
+          }
+          void persistTokenAndProfile(response).then(resolve).catch(reject);
+        },
+        error_callback: (err) => {
+          if (settled) return;
+          settled = true;
+          reject(
+            new Error(
+              err.type === 'popup_failed_to_open'
+                ? 'Browser blocked the Google sign-in popup. Please allow popups for this site.'
+                : err.message || 'Google sign-in was cancelled.'
+            )
+          );
+        },
+      });
 
-  const params = new URLSearchParams({
-    client_id: trimmedId,
-    redirect_uri: window.location.origin,
-    response_type: 'token',
-    scope: GOOGLE_SCOPES.join(' '),
-    include_granted_scopes: 'true',
-    prompt: 'consent',
-    state,
+      tokenClient.requestAccessToken({
+        prompt,
+        hint,
+      });
+    } catch (err) {
+      if (!settled) {
+        settled = true;
+        reject(err instanceof Error ? err : new Error('Failed to start Google sign-in.'));
+      }
+    }
   });
+}
 
-  window.location.assign(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+export async function ensureValidGoogleToken(): Promise<string | null> {
+  const valid = getAccessToken();
+  if (valid) return valid;
+
+  const session = getStoredGoogleSession();
+  const clientId = getSavedClientId();
+  if (session?.email && clientId && (typeof navigator === 'undefined' || navigator.onLine)) {
+    return await silentRefreshGoogleToken(clientId, session.email);
+  }
+  return null;
 }
 
 export function parseOAuthCallbackFromHash(): {
@@ -121,7 +500,6 @@ export function parseOAuthCallbackFromHash(): {
     return {};
   }
 
-  // Clean the URL hash immediately so tokens do not linger in address bar/history
   window.history.replaceState(null, '', window.location.pathname + window.location.search);
 
   let expectedState: string | null = null;
@@ -143,42 +521,51 @@ export function parseOAuthCallbackFromHash(): {
   if (accessToken) {
     const expiresIn = expiresInRaw ? parseInt(expiresInRaw, 10) : 3600;
     const validExpires = Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 3600;
-    cachedAccessToken = accessToken;
-    tokenExpiresAtMs = Date.now() + validExpires * 1000;
+    const existing = getStoredGoogleSession();
+    saveStoredGoogleSession({
+      access_token: accessToken,
+      expires_at: computeExpiresAtMs(validExpires),
+      email: existing?.email,
+      name: existing?.name,
+    });
     return { accessToken, expiresIn: validExpires };
   }
 
   return {};
 }
 
-async function googleFetch(url: string, token: string, init: RequestInit = {}): Promise<Response> {
+async function googleFetch(
+  url: string,
+  token: string,
+  init: RequestInit = {},
+  allowRetry = true
+): Promise<Response> {
+  const bearerToken = getAccessToken() || token;
   const res = await fetch(url, {
     ...init,
     headers: {
       ...(init.headers || {}),
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${bearerToken}`,
     },
   });
-  if (res.status === 401) {
-    cachedAccessToken = null;
-    tokenExpiresAtMs = 0;
-    throw new Error('Google session expired. Please reconnect.');
-  }
-  return res;
-}
 
-export async function fetchUserCalendarEmail(token: string): Promise<string | null> {
-  try {
-    const res = await googleFetch(
-      'https://www.googleapis.com/calendar/v3/calendars/primary?fields=id,summary',
-      token
+  if (res.status === 401) {
+    markStoredTokenExpired();
+    const clientId = getSavedClientId();
+    const { email } = getStoredUserProfile();
+
+    if (allowRetry && clientId && email) {
+      const refreshedToken = await silentRefreshGoogleToken(clientId, email);
+      return googleFetch(url, refreshedToken, init, false);
+    }
+
+    throw new GoogleAuthInteractionRequiredError(
+      'interaction_required',
+      'Google session expired. Please reconnect.'
     );
-    if (!res.ok) return null;
-    const data = (await res.json()) as { id?: string; summary?: string };
-    return data.id || data.summary || null;
-  } catch {
-    return null;
   }
+
+  return res;
 }
 
 // ==========================================
