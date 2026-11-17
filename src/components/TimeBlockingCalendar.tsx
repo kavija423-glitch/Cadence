@@ -34,10 +34,11 @@ import {
 import { formatRepeatLabel } from '../utils/recurrence';
 import { QuickAddTaskBar } from './QuickAddTaskBar';
 
-const START_HOUR = 6;
-const END_HOUR = 23;
+const START_HOUR = 0;
+const END_HOUR = 24;
 const TOTAL_HOURS = END_HOUR - START_HOUR;
 const HOUR_HEIGHT = 60; // 60px per hour => 1px per minute, 15px per 15-min snap
+const CORE_DAY_START_HOUR = 6;
 
 interface TimeBlockingCalendarProps {
   weekStart: Date;
@@ -111,11 +112,25 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
 
-  // Scroll calendar to ~08:00 on initial mount
+  const scrollToSmartAnchor = (behavior: ScrollBehavior = 'auto') => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const now = new Date();
+    const targetHour = Math.max(CORE_DAY_START_HOUR, now.getHours() - 1);
+    const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+    const targetTop = Math.min(targetHour * HOUR_HEIGHT, maxScroll);
+    const prefersReducedMotion =
+      typeof window !== 'undefined' &&
+      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    el.scrollTo({
+      top: targetTop,
+      behavior: prefersReducedMotion ? 'auto' : behavior,
+    });
+  };
+
+  // Smart auto-scroll to 06:00 (or 1h before current time if later) on initial mount
   useEffect(() => {
-    if (scrollContainerRef.current) {
-      scrollContainerRef.current.scrollTop = 2 * HOUR_HEIGHT;
-    }
+    scrollToSmartAnchor('auto');
   }, []);
 
   const weekDays = useMemo(() => getWeekDays(weekStart), [weekStart]);
@@ -292,12 +307,13 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
   const handleCreateSlotSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!creatingSlot || !newBlockTitle.trim()) return;
+    const maxDuration = Math.max(15, END_HOUR * 60 - creatingSlot.startMinutes);
     onCreateBlock({
       subjectId: newBlockSubjectId || subjects[0]?.id || '',
       title: newBlockTitle.trim(),
       date: creatingSlot.date,
       startMinutes: creatingSlot.startMinutes,
-      durationMinutes: newBlockDuration,
+      durationMinutes: Math.min(newBlockDuration, maxDuration),
     });
     setCreatingSlot(null);
   };
@@ -602,6 +618,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
                   const day = now.getDay();
                   const diff = day === 0 ? -6 : 1 - day;
                   onChangeWeekStart(addDays(new Date(now.getFullYear(), now.getMonth(), now.getDate()), diff));
+                  requestAnimationFrame(() => scrollToSmartAnchor('smooth'));
                 }}
                 className="px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 border-x border-slate-200 dark:border-slate-700 cursor-pointer"
               >
@@ -770,7 +787,11 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
                   style={{ height: `${HOUR_HEIGHT}px` }}
                   className="relative border-b border-slate-100 dark:border-slate-800/70 pr-2 text-right"
                 >
-                  <span className="text-[10px] font-mono tabular-nums text-slate-400 dark:text-slate-500 -mt-2 inline-block">
+                  <span
+                    className={`text-[10px] font-mono tabular-nums text-slate-400 dark:text-slate-500 inline-block ${
+                      hr === 0 ? 'mt-0.5' : '-mt-2'
+                    }`}
+                  >
                     {String(hr).padStart(2, '0')}:00
                   </span>
                 </div>
