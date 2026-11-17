@@ -18,6 +18,7 @@ export function createEmptyDatabase(theme: 'light' | 'dark' = 'light'): StudyDat
     calendar_blocks: [],
     study_sessions: [],
     pastPapers: [],
+    syllabusProgress: {},
     settings: {
       pomodoroPreset: '25_5',
       dailyGoalMinutes: 180,

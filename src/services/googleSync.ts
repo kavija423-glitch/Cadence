@@ -5,6 +5,7 @@ import type {
   PastPaperRecord,
   StudyDatabase,
   Subject,
+  SyllabusSubtopicProgress,
   TaskMetadata,
 } from '../types';
 import { toLocalDateKey } from '../utils/dateUtils';
@@ -745,6 +746,28 @@ export function mergeStudyDatabases(local: StudyDatabase, remote: StudyDatabase)
     });
   }
 
+  // Merge syllabusProgress by subtopic id (latest updatedAt wins)
+  const syllabusMap: Record<string, SyllabusSubtopicProgress> = {
+    ...(remote.syllabusProgress || {}),
+  };
+  for (const [id, localEntry] of Object.entries(local.syllabusProgress || {})) {
+    const remoteEntry = syllabusMap[id];
+    if (!remoteEntry) {
+      syllabusMap[id] = localEntry;
+    } else {
+      const lT = new Date(localEntry.updatedAt || 0).getTime();
+      const rT = new Date(remoteEntry.updatedAt || 0).getTime();
+      const winner = lT >= rT ? localEntry : remoteEntry;
+      syllabusMap[id] = {
+        ...winner,
+        revisionCount:
+          lT === rT
+            ? Math.max(localEntry.revisionCount || 0, remoteEntry.revisionCount || 0)
+            : winner.revisionCount,
+      };
+    }
+  }
+
   const settings = localTime >= remoteTime ? local.settings : remote.settings;
 
   return {
@@ -759,6 +782,7 @@ export function mergeStudyDatabases(local: StudyDatabase, remote: StudyDatabase)
     pastPapers: Array.from(paperMap.values()).sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
     ),
+    syllabusProgress: syllabusMap,
     settings,
   };
 }
@@ -1122,14 +1146,28 @@ export async function performFullGoogleSync(params: {
         ? mergeStudyDatabases(localDb, remoteDb)
         : new Date(remoteDb.modifiedTime || 0).getTime() >
           new Date(localDb.modifiedTime || 0).getTime()
-        ? { ...remoteDb, pastPapers: Array.isArray(remoteDb.pastPapers) ? remoteDb.pastPapers : [] }
+        ? {
+            ...remoteDb,
+            pastPapers: Array.isArray(remoteDb.pastPapers) ? remoteDb.pastPapers : [],
+            syllabusProgress:
+              remoteDb.syllabusProgress && typeof remoteDb.syllabusProgress === 'object'
+                ? remoteDb.syllabusProgress
+                : {},
+          }
         : mergeStudyDatabases(localDb, remoteDb);
     }
   }
 
-  // Ensure pastPapers slice is always defined
-  if (!Array.isArray(workingDb.pastPapers)) {
-    workingDb = { ...workingDb, pastPapers: [] };
+  // Ensure pastPapers & syllabusProgress slices are always defined
+  if (!Array.isArray(workingDb.pastPapers) || !workingDb.syllabusProgress) {
+    workingDb = {
+      ...workingDb,
+      pastPapers: Array.isArray(workingDb.pastPapers) ? workingDb.pastPapers : [],
+      syllabusProgress:
+        workingDb.syllabusProgress && typeof workingDb.syllabusProgress === 'object'
+          ? workingDb.syllabusProgress
+          : {},
+    };
   }
 
   // Step 2: Two-way Google Tasks Sync

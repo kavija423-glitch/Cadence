@@ -11,6 +11,7 @@ import {
   AlertCircle,
   X,
   FileText,
+  BookOpen,
 } from 'lucide-react';
 import type {
   ALSubjectKey,
@@ -24,6 +25,7 @@ import type {
   RepeatRule,
   StudyDatabase,
   StudySession,
+  SyllabusSubtopicProgress,
   SyncStatusInfo,
   TaskMetadata,
   TimerMode,
@@ -66,11 +68,16 @@ import {
 } from './components/StudyTimer';
 import { AnalyticsDashboard } from './components/AnalyticsDashboard';
 import { PapersView } from './components/PapersView';
+import { SyllabusView } from './components/SyllabusView';
 import {
   AL_SUBJECT_CONFIGS,
   findMatchingUserSubject,
   type RedoQueueEntry,
 } from './utils/pastPapers';
+import type {
+  ResolvedSubtopicItem,
+  SyllabusUnitSeed,
+} from './utils/syllabusData';
 
 const DB_STORAGE_KEY = 'cadence_study_db_v1';
 const TIMER_STORAGE_KEY = 'cadence_active_timer_v1';
@@ -84,6 +91,10 @@ function loadDatabase(): StudyDatabase {
         return {
           ...parsed,
           pastPapers: Array.isArray(parsed.pastPapers) ? parsed.pastPapers : [],
+          syllabusProgress:
+            parsed.syllabusProgress && typeof parsed.syllabusProgress === 'object'
+              ? parsed.syllabusProgress
+              : {},
         };
       }
     }
@@ -899,6 +910,10 @@ export default function App() {
       () => ({
         ...parsed,
         pastPapers: Array.isArray(parsed.pastPapers) ? parsed.pastPapers : [],
+        syllabusProgress:
+          parsed.syllabusProgress && typeof parsed.syllabusProgress === 'object'
+            ? parsed.syllabusProgress
+            : {},
       }),
       true
     );
@@ -1067,6 +1082,142 @@ export default function App() {
     });
   };
 
+  // Syllabus Progress Handlers
+  const handleUpdateSyllabusSubtopic = (
+    subtopic: ResolvedSubtopicItem,
+    patch: Partial<SyllabusSubtopicProgress>
+  ) => {
+    const nowIso = new Date().toISOString();
+    mutateDb((prev) => {
+      const currentMap = prev.syllabusProgress || {};
+      const existing = currentMap[subtopic.id];
+      const nextEntry: SyllabusSubtopicProgress = {
+        id: subtopic.id,
+        unitId: subtopic.unitId,
+        subject: subtopic.subject,
+        title: subtopic.title,
+        isCustom: subtopic.isCustom,
+        status: existing?.status || subtopic.status || 'not_started',
+        confidence: existing?.confidence || subtopic.confidence || 1,
+        revisionCount: existing?.revisionCount ?? subtopic.revisionCount ?? 0,
+        lastRevisedAt: existing?.lastRevisedAt ?? subtopic.lastRevisedAt,
+        note: existing?.note ?? subtopic.note,
+        ...patch,
+        updatedAt: nowIso,
+      };
+      return {
+        ...prev,
+        syllabusProgress: {
+          ...currentMap,
+          [subtopic.id]: nextEntry,
+        },
+      };
+    });
+  };
+
+  const handleAddCustomSyllabusSubtopic = (
+    unit: SyllabusUnitSeed,
+    title: string
+  ) => {
+    const nowIso = new Date().toISOString();
+    const id = `custom-${unit.id}-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 5)}`;
+    mutateDb((prev) => ({
+      ...prev,
+      syllabusProgress: {
+        ...(prev.syllabusProgress || {}),
+        [id]: {
+          id,
+          unitId: unit.id,
+          subject: unit.subject,
+          title,
+          isCustom: true,
+          status: 'not_started',
+          confidence: 1,
+          revisionCount: 0,
+          updatedAt: nowIso,
+        },
+      },
+    }));
+  };
+
+  const handleDeleteCustomSyllabusSubtopic = (subtopicId: string) => {
+    const nowIso = new Date().toISOString();
+    mutateDb((prev) => {
+      const existing = prev.syllabusProgress?.[subtopicId];
+      if (!existing) return prev;
+      return {
+        ...prev,
+        syllabusProgress: {
+          ...(prev.syllabusProgress || {}),
+          [subtopicId]: {
+            ...existing,
+            deleted: true,
+            updatedAt: nowIso,
+          },
+        },
+      };
+    });
+  };
+
+  const handleAddSyllabusRevisionTask = (params: {
+    subject: ALSubjectKey;
+    subtopicTitle: string;
+    unitTitle: string;
+    note?: string;
+    isUrgent?: boolean;
+  }) => {
+    const nowIso = new Date().toISOString();
+    const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const todayDue = toLocalDateKey(new Date());
+
+    mutateDb((prev) => {
+      const matched = findMatchingUserSubject(params.subject, prev.subjects);
+      let resolvedSubjectId = matched?.id || '';
+      let nextSubjects = prev.subjects;
+
+      if (!matched) {
+        const cfg = AL_SUBJECT_CONFIGS[params.subject];
+        const newSubjId = `subj-${params.subject}-${Date.now()}`;
+        resolvedSubjectId = newSubjId;
+        nextSubjects = [
+          ...prev.subjects,
+          {
+            id: newSubjId,
+            name: cfg.label,
+            color: cfg.defaultColor,
+            updatedAt: nowIso,
+          },
+        ];
+      }
+
+      const taskNotes = [params.unitTitle, params.note]
+        .filter(Boolean)
+        .join('\n');
+
+      return {
+        ...prev,
+        subjects: nextSubjects,
+        tasks_metadata: {
+          ...prev.tasks_metadata,
+          [taskId]: {
+            google_task_id: taskId,
+            subjectId: resolvedSubjectId,
+            title: `Revise: ${params.subtopicTitle}`,
+            notes: taskNotes || undefined,
+            due: todayDue,
+            status: 'needsAction',
+            estimated_minutes: 45,
+            logged_minutes: 0,
+            priority: params.isUrgent ? 'high' : 'medium',
+            updatedAt: nowIso,
+          },
+        },
+      };
+    });
+  };
+
   const activeSubject = useMemo(
     () => db.subjects.find((s) => s.id === timer.subjectId) || db.subjects[0],
     [db.subjects, timer.subjectId]
@@ -1078,6 +1229,7 @@ export default function App() {
     { id: 'timer', label: 'Timer', icon: <TimerIcon className="w-5 h-5" /> },
     { id: 'analytics', label: 'Stats', icon: <BarChart3 className="w-5 h-5" /> },
     { id: 'papers', label: 'Papers', icon: <FileText className="w-5 h-5" /> },
+    { id: 'syllabus', label: 'Syllabus', icon: <BookOpen className="w-5 h-5" /> },
   ];
 
   const syncLabel = !isOnline
@@ -1091,9 +1243,9 @@ export default function App() {
     : 'Preferences';
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+    <div className="min-h-screen flex flex-col overflow-x-clip bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
       {/* TOP BAR (3-Zone Contract) */}
-      <header className="sticky top-0 z-30 flex items-center justify-between gap-4 sm:gap-8 h-13 sm:h-14 border-b border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md px-4 sm:px-6">
+      <header className="sticky top-0 z-30 flex items-center justify-between gap-4 sm:gap-8 h-13 sm:h-14 min-h-0 border-b border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md px-4 sm:px-6">
         {/* Zone 1: Single-line brand wordmark */}
         <a
           href="#top"
@@ -1335,6 +1487,18 @@ export default function App() {
             onStartRedoTimer={handleStartRedoTimer}
           />
         )}
+
+        {activeTab === 'syllabus' && (
+          <SyllabusView
+            subjects={db.subjects}
+            syllabusProgress={db.syllabusProgress || {}}
+            onUpdateSubtopic={handleUpdateSyllabusSubtopic}
+            onAddCustomSubtopic={handleAddCustomSyllabusSubtopic}
+            onDeleteCustomSubtopic={handleDeleteCustomSyllabusSubtopic}
+            onAddRevisionTask={handleAddSyllabusRevisionTask}
+            onStartRevisionTimer={handleStartRedoTimer}
+          />
+        )}
       </main>
 
       {/* PERSISTENT DOCKED STUDY TIMER BAR */}
@@ -1397,7 +1561,7 @@ export default function App() {
       {/* MOBILE BOTTOM NAVIGATION BAR */}
       <nav
         aria-label="Mobile navigation"
-        className="md:hidden fixed bottom-0 left-0 right-0 z-40 grid grid-cols-5 items-center h-16 pb-safe border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 grid grid-cols-6 items-center h-16 pb-safe border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md"
       >
         {navItems.map((item) => {
           const active = activeTab === item.id;
@@ -1406,14 +1570,14 @@ export default function App() {
               key={item.id}
               type="button"
               onClick={() => setActiveTab(item.id)}
-              className={`flex flex-col items-center justify-center min-h-[44px] min-w-0 px-1 py-1.5 transition-colors whitespace-nowrap cursor-pointer ${
+              className={`flex flex-col items-center justify-center min-h-[44px] min-w-0 px-0.5 py-1.5 transition-colors whitespace-nowrap cursor-pointer ${
                 active
                   ? 'text-blue-600 dark:text-blue-400'
                   : 'text-slate-500 dark:text-slate-400'
               }`}
             >
               {item.icon}
-              <span className="text-[11px] font-medium tracking-tight mt-0.5 truncate">
+              <span className="text-[10px] sm:text-[11px] font-medium tracking-tight mt-0.5 truncate">
                 {item.label}
               </span>
             </button>

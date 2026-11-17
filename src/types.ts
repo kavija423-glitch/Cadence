@@ -137,6 +137,27 @@ export interface PastPaperRecord {
   deleted?: boolean;
 }
 
+export type SyllabusMasteryStatus =
+  | 'not_started'
+  | 'learning'
+  | 'needs_revision'
+  | 'mastered';
+
+export interface SyllabusSubtopicProgress {
+  id: string;
+  unitId: string;
+  subject: ALSubjectKey;
+  title: string;
+  isCustom?: boolean;
+  status: SyllabusMasteryStatus;
+  confidence: 1 | 2 | 3 | 4 | 5;
+  revisionCount: number;
+  lastRevisedAt?: string;
+  note?: string;
+  updatedAt: string;
+  deleted?: boolean;
+}
+
 export interface StudyDatabase {
   version: number;
   modifiedTime: string; // ISO timestamp for Drive sync conflict resolution
@@ -145,6 +166,7 @@ export interface StudyDatabase {
   calendar_blocks: CalendarBlock[];
   study_sessions: StudySession[];
   pastPapers: PastPaperRecord[];
+  syllabusProgress: Record<string, SyllabusSubtopicProgress>;
   settings: AppSettings;
 }
 
@@ -186,5 +208,11 @@ export interface SyncStatusInfo {
   errorMessage?: string;
 }
 
-export type MainTab = 'workspace' | 'tasks' | 'timer' | 'analytics' | 'papers';
+export type MainTab =
+  | 'workspace'
+  | 'tasks'
+  | 'timer'
+  | 'analytics'
+  | 'papers'
+  | 'syllabus';
 export type TaskFilter = 'today' | 'upcoming' | 'unscheduled' | 'completed' | 'all';
