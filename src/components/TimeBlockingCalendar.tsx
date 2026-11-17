@@ -11,6 +11,8 @@ import {
   Trash2,
   Flag,
   Repeat,
+  ExternalLink,
+  CheckSquare,
 } from 'lucide-react';
 import type {
   CalendarBlock,
@@ -109,6 +111,14 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
   } | null>(null);
   const [selectedBlock, setSelectedBlock] = useState<CalendarBlock | null>(null);
   const [editingBlockTitle, setEditingBlockTitle] = useState('');
+  const [selectedGcalEvent, setSelectedGcalEvent] = useState<GoogleCalendarEventOverlay | null>(null);
+  const [gcalConvertSubjectId, setGcalConvertSubjectId] = useState(subjects[0]?.id || '');
+  const [gcalConvertDuration, setGcalConvertDuration] = useState(60);
+  const [dragCreatePreview, setDragCreatePreview] = useState<{
+    date: string;
+    startMinutes: number;
+    durationMinutes: number;
+  } | null>(null);
   const [creatingSlot, setCreatingSlot] = useState<{
     date: string;
     startMinutes: number;
@@ -124,6 +134,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
   const [examDate, setExamDate] = useState(() => toLocalDateKey(addDays(new Date(), 14)));
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const suppressNextEmptyClickRef = useRef(false);
 
   const scrollToSmartAnchor = (behavior: ScrollBehavior = 'auto') => {
     const el = scrollContainerRef.current;
@@ -322,13 +333,86 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
     window.addEventListener('pointerup', onUp);
   };
 
+  const handleColumnPointerDown = (e: React.PointerEvent, dateKey: string) => {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest('[data-calendar-block="true"]')) return;
+
+    const colEl = e.currentTarget as HTMLElement;
+    const startY = e.clientY;
+    const anchorMins = getMinutesFromPointerY(startY, colEl);
+    let hasDragged = false;
+    let latestStart = anchorMins;
+    let latestDuration = 60;
+
+    const onMove = (moveEvent: PointerEvent) => {
+      if (Math.abs(moveEvent.clientY - startY) < 12 && !hasDragged) return;
+      hasDragged = true;
+      const currentMins = getMinutesFromPointerY(moveEvent.clientY, colEl);
+      latestStart = Math.min(anchorMins, currentMins);
+      const endMins = Math.min(END_HOUR * 60, Math.max(anchorMins, currentMins) + 15);
+      latestDuration = Math.max(15, endMins - latestStart);
+      setDragCreatePreview({
+        date: dateKey,
+        startMinutes: latestStart,
+        durationMinutes: latestDuration,
+      });
+    };
+
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      setDragCreatePreview(null);
+      if (hasDragged) {
+        suppressNextEmptyClickRef.current = true;
+        setNewBlockTitle('');
+        setNewBlockSubjectId(subjects[0]?.id || '');
+        setNewBlockDuration(latestDuration);
+        setCreatingSlot({ date: dateKey, startMinutes: latestStart });
+      }
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
   const handleEmptySlotClick = (e: React.MouseEvent, dateKey: string) => {
+    if (suppressNextEmptyClickRef.current) {
+      suppressNextEmptyClickRef.current = false;
+      return;
+    }
     if ((e.target as HTMLElement).closest('[data-calendar-block="true"]')) return;
     const startMinutes = getMinutesFromPointerY(e.clientY, e.currentTarget as HTMLElement);
     setNewBlockTitle('');
     setNewBlockSubjectId(subjects[0]?.id || '');
     setNewBlockDuration(60);
     setCreatingSlot({ date: dateKey, startMinutes });
+  };
+
+  const openGcalEventModal = (ev: GoogleCalendarEventOverlay) => {
+    const lowerSummary = ev.summary.toLowerCase();
+    const matchedSubj = subjects.find((s) =>
+      lowerSummary.includes(s.name.trim().toLowerCase())
+    );
+    setGcalConvertSubjectId(matchedSubj?.id || subjects[0]?.id || '');
+    setGcalConvertDuration(
+      snapMinutes15(Math.max(15, Math.min(480, ev.durationMinutes || 60)))
+    );
+    setSelectedGcalEvent(ev);
+  };
+
+  const handleConvertGcalEventSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedGcalEvent) return;
+    const maxDuration = Math.max(15, END_HOUR * 60 - selectedGcalEvent.startMinutes);
+    onCreateBlock({
+      subjectId: gcalConvertSubjectId || subjects[0]?.id || '',
+      title: selectedGcalEvent.summary || 'Study Session',
+      date: selectedGcalEvent.date,
+      startMinutes: selectedGcalEvent.startMinutes,
+      durationMinutes: Math.min(gcalConvertDuration, maxDuration),
+      ...(selectedGcalEvent.isAllDay ? {} : { googleEventId: selectedGcalEvent.id }),
+    });
+    setSelectedGcalEvent(null);
   };
 
   const handleCreateSlotSubmit = (e: React.FormEvent) => {
@@ -399,6 +483,23 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
           </div>
         )}
 
+        {/* Drag-to-Create Timeline Selection Ghost */}
+        {dragCreatePreview && dragCreatePreview.date === dateKey && (
+          <div
+            style={{
+              top: `${((dragCreatePreview.startMinutes - START_HOUR * 60) / 60) * HOUR_HEIGHT}px`,
+              height: `${Math.max(18, (dragCreatePreview.durationMinutes / 60) * HOUR_HEIGHT)}px`,
+            }}
+            className="absolute inset-x-1 z-30 rounded-lg border-2 border-dashed border-blue-600 bg-blue-500/15 pointer-events-none px-2 py-1 text-[11px] font-mono text-blue-700 dark:text-blue-300"
+          >
+            {formatMinutesAsClock(dragCreatePreview.startMinutes)}–
+            {formatMinutesAsClock(
+              dragCreatePreview.startMinutes + dragCreatePreview.durationMinutes
+            )}{' '}
+            ({formatDurationCompact(dragCreatePreview.durationMinutes)})
+          </div>
+        )}
+
         {/* External Google Calendar Event Overlay */}
         {dayGcal.map((ev) => {
           const clampedStart = Math.max(START_HOUR * 60, ev.startMinutes);
@@ -410,9 +511,23 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
           return (
             <div
               key={`gcal-${ev.id}`}
+              data-calendar-block="true"
+              role="button"
+              tabIndex={0}
+              onClick={(e) => {
+                e.stopPropagation();
+                openGcalEventModal(ev);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  openGcalEventModal(ev);
+                }
+              }}
               style={{ top: `${topPx}px`, height: `${heightPx}px` }}
-              title={`${ev.summary} (Google Calendar)`}
-              className="absolute left-1 right-1 z-10 rounded-lg border border-slate-200 dark:border-slate-700/80 bg-slate-100/90 dark:bg-slate-800/70 gcal-overlay-pattern px-2 py-1 overflow-hidden pointer-events-none"
+              title={`${ev.summary} (Google Calendar · Click for options)`}
+              className="absolute left-1 right-1 z-10 rounded-lg border border-slate-200 dark:border-slate-700/80 bg-slate-100/90 dark:bg-slate-800/70 gcal-overlay-pattern px-2 py-1 overflow-hidden pointer-events-auto cursor-pointer hover:border-slate-400 dark:hover:border-slate-500 transition-colors"
             >
               <div className="flex items-center gap-1 text-[11px] font-medium text-slate-500 dark:text-slate-400 truncate">
                 <Lock className="w-2.5 h-2.5 shrink-0 opacity-75" />
@@ -913,6 +1028,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
 
             {/* Mobile Single-Day Column */}
             <div
+              onPointerDown={(e) => handleColumnPointerDown(e, selectedMobileDay)}
               onClick={(e) => handleEmptySlotClick(e, selectedMobileDay)}
               className="relative lg:hidden bg-white dark:bg-slate-950"
               style={{ height: `${TOTAL_HOURS * HOUR_HEIGHT}px` }}
@@ -926,6 +1042,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
               return (
                 <div
                   key={dateKey}
+                  onPointerDown={(e) => handleColumnPointerDown(e, dateKey)}
                   onDragOver={(e) => handleColumnDragOver(e, dateKey)}
                   onDragLeave={() => setDragPreview(null)}
                   onDrop={(e) => handleColumnDrop(e, dateKey)}
@@ -992,6 +1109,32 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
               >
                 <X className="w-4 h-4" />
               </button>
+            </div>
+
+            <div className="space-y-1.5">
+              <label
+                htmlFor="edit-block-subject"
+                className="block text-xs font-medium text-slate-600 dark:text-slate-300"
+              >
+                Subject
+              </label>
+              <select
+                id="edit-block-subject"
+                value={selectedBlock.subjectId}
+                onChange={(e) => {
+                  const nextSubjectId = e.target.value;
+                  onUpdateBlock(selectedBlock.id, { subjectId: nextSubjectId });
+                  setSelectedBlock({ ...selectedBlock, subjectId: nextSubjectId });
+                }}
+                className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-xs font-medium text-slate-900 dark:text-slate-100"
+              >
+                <option value="">No Subject</option>
+                {subjects.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
+              </select>
             </div>
 
             <div className="space-y-2">
@@ -1173,8 +1316,9 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
               </button>
             </div>
             <p className="text-xs font-mono tabular-nums text-slate-500">
-              {formatShortDate(creatingSlot.date)} · Starts at{' '}
-              {formatMinutesAsClock(creatingSlot.startMinutes)}
+              {formatShortDate(creatingSlot.date)} ·{' '}
+              {formatMinutesAsClock(creatingSlot.startMinutes)}–
+              {formatMinutesAsClock(creatingSlot.startMinutes + newBlockDuration)}
             </p>
             <div className="space-y-3">
               <input
@@ -1204,11 +1348,15 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
                   onChange={(e) => setNewBlockDuration(Number(e.target.value))}
                   className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm font-mono text-slate-900 dark:text-slate-100"
                 >
-                  {[15, 30, 45, 60, 75, 90, 120, 150, 180].map((m) => (
-                    <option key={m} value={m}>
-                      {formatDurationCompact(m)}
-                    </option>
-                  ))}
+                  {Array.from(
+                    new Set([15, 30, 45, 60, 75, 90, 120, 150, 180, newBlockDuration])
+                  )
+                    .sort((a, b) => a - b)
+                    .map((m) => (
+                      <option key={m} value={m}>
+                        {formatDurationCompact(m)}
+                      </option>
+                    ))}
                 </select>
               </div>
             </div>
@@ -1226,6 +1374,120 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
               >
                 Create Block
               </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* External Google Calendar Event Detail / Convert Modal */}
+      {selectedGcalEvent && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/50 backdrop-blur-xs p-0 sm:p-4">
+          <form
+            onSubmit={handleConvertGcalEventSubmit}
+            className="w-full max-w-sm rounded-t-3xl sm:rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                  <Lock className="w-3 h-3" />
+                  <span>{selectedGcalEvent.calendarName || 'Google Calendar Event'}</span>
+                </div>
+                <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100 mt-1">
+                  {selectedGcalEvent.summary}
+                </h3>
+                <p className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400 mt-1">
+                  {formatShortDate(selectedGcalEvent.date)} ·{' '}
+                  {selectedGcalEvent.isAllDay
+                    ? 'All day'
+                    : `${formatMinutesAsClock(selectedGcalEvent.startMinutes)}–${formatMinutesAsClock(
+                        selectedGcalEvent.startMinutes + selectedGcalEvent.durationMinutes
+                      )} · ${formatDurationCompact(selectedGcalEvent.durationMinutes)}`}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedGcalEvent(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+              External Google Calendar events stay separate from your task backlog. Convert this event below if you want to track it as a study block and linked task.
+            </p>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
+                  Subject
+                </label>
+                <select
+                  value={gcalConvertSubjectId}
+                  onChange={(e) => setGcalConvertSubjectId(e.target.value)}
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-xs font-medium text-slate-900 dark:text-slate-100"
+                >
+                  <option value="">No Subject</option>
+                  {subjects.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
+                  Duration
+                </label>
+                <select
+                  value={gcalConvertDuration}
+                  onChange={(e) => setGcalConvertDuration(Number(e.target.value))}
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-xs font-mono text-slate-900 dark:text-slate-100"
+                >
+                  {Array.from(
+                    new Set([15, 30, 45, 60, 75, 90, 120, 150, 180, gcalConvertDuration])
+                  )
+                    .sort((a, b) => a - b)
+                    .map((m) => (
+                      <option key={m} value={m}>
+                        {formatDurationCompact(m)}
+                      </option>
+                    ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+              {selectedGcalEvent.htmlLink ? (
+                <a
+                  href={selectedGcalEvent.htmlLink}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Open in Google</span>
+                </a>
+              ) : (
+                <span />
+              )}
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setSelectedGcalEvent(null)}
+                  className="rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
+                >
+                  Close
+                </button>
+                <button
+                  type="submit"
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 px-3.5 py-2 text-xs font-medium text-white cursor-pointer"
+                >
+                  <CheckSquare className="w-3.5 h-3.5" />
+                  <span>Convert to Study Block &amp; Task</span>
+                </button>
+              </div>
             </div>
           </form>
         </div>

@@ -26,6 +26,7 @@ import type {
   StudyDatabase,
   StudySession,
   SyllabusSubtopicProgress,
+  SyncSource,
   SyncStatusInfo,
   TaskMetadata,
   TimerMode,
@@ -44,7 +45,9 @@ import {
   GoogleCalendarScopeUpgradeRequiredError,
   clearAccessToken,
   createGoogleCalendarEventForBlock,
+  createGoogleTaskRemote,
   deleteGoogleCalendarEventById,
+  deleteGoogleTaskRemote,
   ensureValidGoogleToken,
   fetchGoogleCalendarOverlay,
   fetchGoogleUserProfile,
@@ -59,6 +62,7 @@ import {
   saveClientId,
   silentRefreshGoogleToken,
   updateGoogleCalendarEventForBlock,
+  updateGoogleTaskRemote,
 } from './services/googleSync';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
@@ -159,6 +163,7 @@ export default function App() {
   const [isGoogleConnected, setIsGoogleConnected] = useState<boolean>(() => hasValidAccessToken());
   const [dismissedReconnectBanner, setDismissedReconnectBanner] = useState(false);
   const [dismissedScopeUpgradeBanner, setDismissedScopeUpgradeBanner] = useState(false);
+  const [dismissedErrorBanner, setDismissedErrorBanner] = useState(false);
   const [googleEvents, setGoogleEvents] = useState<GoogleCalendarEventOverlay[]>([]);
   const [syncStatus, setSyncStatus] = useState<SyncStatusInfo>(() => {
     const profile = getStoredUserProfile();
@@ -215,6 +220,7 @@ export default function App() {
         return;
       }
 
+      setDismissedErrorBanner(false);
       setSyncStatus((prev) => ({ ...prev, state: 'syncing', errorMessage: undefined }));
       try {
         let token = explicitToken || getAccessToken();
@@ -243,9 +249,21 @@ export default function App() {
         setDismissedReconnectBanner(false);
         setDb(result.mergedDb);
         setGoogleEvents(result.calendarEvents);
+
+        const hasCalErrors = result.calendarSyncErrors.length > 0;
+        const calErrorSummary = hasCalErrors
+          ? result.calendarSyncErrors.length === 1
+            ? result.calendarSyncErrors[0]
+            : `${result.calendarSyncErrors.length} Google Calendar sync errors: ${result.calendarSyncErrors[0]}`
+          : undefined;
+
+        if (hasCalErrors) {
+          setDismissedErrorBanner(false);
+        }
+
         setSyncStatus((prev) => ({
           ...prev,
-          state: 'synced',
+          state: hasCalErrors ? 'error' : 'synced',
           lastSyncedAt: new Date().toISOString(),
           remoteFileId: result.remoteFileId,
           remoteModifiedTime: result.remoteModifiedTime,
@@ -254,7 +272,7 @@ export default function App() {
           needsReconnect: false,
           needsCalendarScopeUpgrade: false,
           reconnectReason: undefined,
-          errorMessage: undefined,
+          errorMessage: calErrorSummary,
         }));
       } catch (err) {
         if (err instanceof GoogleCalendarScopeUpgradeRequiredError) {
@@ -280,6 +298,7 @@ export default function App() {
           return;
         }
         const msg = err instanceof Error ? err.message : 'Google sync failed.';
+        setDismissedErrorBanner(false);
         setSyncStatus((prev) => ({
           ...prev,
           state: 'error',
@@ -326,7 +345,16 @@ export default function App() {
           reconnectReason: err.code,
           errorMessage: undefined,
         }));
+        return;
       }
+      const msg =
+        err instanceof Error ? err.message : 'Google Calendar / Tasks sync failed.';
+      setDismissedErrorBanner(false);
+      setSyncStatus((prev) => ({
+        ...prev,
+        state: 'error',
+        errorMessage: msg,
+      }));
     }
   }, []);
 
@@ -364,6 +392,136 @@ export default function App() {
       }
     },
     [runSync]
+  );
+
+  const pushAndPromoteLocalTask = useCallback(
+    (localTask: TaskMetadata) => {
+      const localId = localTask.google_task_id;
+      const subject = dbRef.current.subjects.find((s) => s.id === localTask.subjectId);
+
+      void runCalendarMutation(async (token) => {
+        const created = await createGoogleTaskRemote(token, localTask, subject);
+        const latestLocal = dbRef.current.tasks_metadata[localId];
+
+        if (!latestLocal || latestLocal.deleted) {
+          await deleteGoogleTaskRemote(token, created.googleTaskListId, created.googleTaskId);
+          mutateDb((prev) => {
+            const nextTasks = { ...prev.tasks_metadata };
+            delete nextTasks[localId];
+            return { ...prev, tasks_metadata: nextTasks };
+          });
+          return;
+        }
+
+        const promotedTask: TaskMetadata = {
+          ...latestLocal,
+          google_task_id: created.googleTaskId,
+          googleTaskListId: created.googleTaskListId,
+          updatedAt: latestLocal.updatedAt || created.updatedAt,
+        };
+
+        mutateDb((prev) => {
+          const nextTasks = { ...prev.tasks_metadata };
+          delete nextTasks[localId];
+          nextTasks[created.googleTaskId] = promotedTask;
+
+          return {
+            ...prev,
+            subjects: prev.subjects.map((s) =>
+              s.id === promotedTask.subjectId && !s.googleTaskListId
+                ? { ...s, googleTaskListId: created.googleTaskListId }
+                : s
+            ),
+            tasks_metadata: nextTasks,
+            calendar_blocks: prev.calendar_blocks.map((b) =>
+              b.taskId === localId ? { ...b, taskId: created.googleTaskId } : b
+            ),
+            study_sessions: prev.study_sessions.map((sess) =>
+              sess.taskId === localId ? { ...sess, taskId: created.googleTaskId } : sess
+            ),
+          };
+        });
+
+        setTimer((prev) =>
+          prev.taskId === localId ? { ...prev, taskId: created.googleTaskId } : prev
+        );
+
+        // If the task was updated (e.g., completed or renamed) while creation was in flight, push latest fields
+        if (
+          latestLocal.title !== localTask.title ||
+          latestLocal.status !== localTask.status ||
+          latestLocal.subjectId !== localTask.subjectId ||
+          latestLocal.due !== localTask.due
+        ) {
+          const latestSubject = dbRef.current.subjects.find(
+            (s) => s.id === promotedTask.subjectId
+          );
+          await updateGoogleTaskRemote(token, promotedTask, latestSubject);
+        }
+      });
+    },
+    [mutateDb, runCalendarMutation]
+  );
+
+  const syncTaskChangeToGoogleTasks = useCallback(
+    (taskSnapshot: TaskMetadata, syncSource: SyncSource = 'task') => {
+      if (syncSource === 'google_tasks') return;
+      if (!taskSnapshot.googleTaskListId) return;
+      const prevTaskId = taskSnapshot.google_task_id;
+      const subject = dbRef.current.subjects.find((s) => s.id === taskSnapshot.subjectId);
+
+      void runCalendarMutation(async (token) => {
+        const result = await updateGoogleTaskRemote(token, taskSnapshot, subject, {
+          syncSource,
+        });
+        if (
+          result.googleTaskId !== prevTaskId ||
+          result.googleTaskListId !== taskSnapshot.googleTaskListId
+        ) {
+          mutateDb((prev) => {
+            const current = prev.tasks_metadata[prevTaskId];
+            if (!current) return prev;
+            const nextTasks = { ...prev.tasks_metadata };
+            delete nextTasks[prevTaskId];
+            nextTasks[result.googleTaskId] = {
+              ...current,
+              google_task_id: result.googleTaskId,
+              googleTaskListId: result.googleTaskListId,
+              updatedAt: result.updatedAt || current.updatedAt,
+            };
+            return {
+              ...prev,
+              tasks_metadata: nextTasks,
+              calendar_blocks: prev.calendar_blocks.map((b) =>
+                b.taskId === prevTaskId ? { ...b, taskId: result.googleTaskId } : b
+              ),
+              study_sessions: prev.study_sessions.map((sess) =>
+                sess.taskId === prevTaskId ? { ...sess, taskId: result.googleTaskId } : sess
+              ),
+            };
+          });
+          setTimer((prev) =>
+            prev.taskId === prevTaskId ? { ...prev, taskId: result.googleTaskId } : prev
+          );
+        } else if (result.updatedAt && result.updatedAt !== taskSnapshot.updatedAt) {
+          setDb((prev) => {
+            const current = prev.tasks_metadata[prevTaskId];
+            if (!current || current.updatedAt !== taskSnapshot.updatedAt) return prev;
+            return {
+              ...prev,
+              tasks_metadata: {
+                ...prev.tasks_metadata,
+                [prevTaskId]: {
+                  ...current,
+                  updatedAt: result.updatedAt,
+                },
+              },
+            };
+          });
+        }
+      });
+    },
+    [mutateDb, runCalendarMutation]
   );
 
   // Refresh Google Calendar overlay when switching weeks while connected
@@ -522,6 +680,7 @@ export default function App() {
       }));
       await runSync(result.accessToken);
     } catch (err) {
+      setDismissedErrorBanner(false);
       setSyncStatus((prev) => ({
         ...prev,
         state: 'error',
@@ -559,6 +718,7 @@ export default function App() {
       }));
       await runSync(result.accessToken);
     } catch (err) {
+      setDismissedErrorBanner(false);
       setSyncStatus((prev) => ({
         ...prev,
         state: 'error',
@@ -572,6 +732,7 @@ export default function App() {
     setIsGoogleConnected(false);
     setDismissedReconnectBanner(false);
     setDismissedScopeUpgradeBanner(false);
+    setDismissedErrorBanner(false);
     setGoogleEvents([]);
     setSyncStatus({
       state: 'local',
@@ -739,7 +900,11 @@ export default function App() {
     setFocusOverlayOpen(true);
   };
 
-  const handleSaveSession = (rating: 1 | 2 | 3 | 4 | 5, notes: string) => {
+  const handleSaveSession = (
+    rating: 1 | 2 | 3 | 4 | 5,
+    notes: string,
+    markCompleted = false
+  ) => {
     const totalMs = computeElapsedMs(timer);
     const durationSeconds = Math.max(1, Math.round(totalMs / 1000));
     const endedAt = new Date();
@@ -747,6 +912,7 @@ export default function App() {
     const meetsOneMinute = totalMs >= 60_000;
     const loggedMins = meetsOneMinute ? Math.max(1, Math.round(totalMs / 60_000)) : 0;
     const sessionDateKey = toLocalDateKey(endedAt);
+    const nowIso = new Date().toISOString();
 
     const newSession: StudySession = {
       id: `sess-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -762,8 +928,33 @@ export default function App() {
       calendarBlockId: timer.calendarBlockId,
     };
 
+    // Pre-resolve target block & task so we can also trigger immediate remote completion sync
+    let preTargetBlockId = timer.calendarBlockId;
+    if (!preTargetBlockId && timer.taskId) {
+      const taskBlocks = dbRef.current.calendar_blocks.filter(
+        (b) => !b.deleted && b.taskId === timer.taskId
+      );
+      const todayMatch =
+        taskBlocks.find((b) => b.date === sessionDateKey && !b.completed) ||
+        taskBlocks.find((b) => b.date === sessionDateKey);
+      const fallbackMatch =
+        taskBlocks.find((b) => !b.completed) || taskBlocks[taskBlocks.length - 1];
+      preTargetBlockId = (todayMatch || fallbackMatch)?.id;
+    }
+    const preTargetBlock = preTargetBlockId
+      ? dbRef.current.calendar_blocks.find((b) => b.id === preTargetBlockId)
+      : undefined;
+    const willAutoCompleteBlock =
+      !!preTargetBlock &&
+      loggedMins > 0 &&
+      (preTargetBlock.actualMinutes || 0) + loggedMins >= preTargetBlock.durationMinutes;
+    const shouldCompleteLinked = markCompleted || willAutoCompleteBlock;
+    const preResolvedTaskId = timer.taskId || preTargetBlock?.taskId;
+    const preExistingTask = preResolvedTaskId
+      ? dbRef.current.tasks_metadata[preResolvedTaskId]
+      : undefined;
+
     mutateDb((prev) => {
-      const nowIso = new Date().toISOString();
       const nextTasks = { ...prev.tasks_metadata };
       if (loggedMins > 0 && timer.taskId && nextTasks[timer.taskId]) {
         nextTasks[timer.taskId] = {
@@ -773,7 +964,6 @@ export default function App() {
         };
       }
 
-      // Resolve target calendar block: explicit calendarBlockId first, else best matching block for timer.taskId
       let targetBlockId = timer.calendarBlockId;
       if (!targetBlockId && timer.taskId) {
         const taskBlocks = prev.calendar_blocks.filter(
@@ -787,19 +977,75 @@ export default function App() {
         targetBlockId = (todayMatch || fallbackMatch)?.id;
       }
 
-      const nextBlocks =
-        targetBlockId && loggedMins > 0
-          ? prev.calendar_blocks.map((b) => {
-              if (b.id !== targetBlockId) return b;
-              const nextActual = (b.actualMinutes || 0) + loggedMins;
-              return {
-                ...b,
-                actualMinutes: nextActual,
-                completed: nextActual >= b.durationMinutes ? true : b.completed,
-                updatedAt: nowIso,
-              };
-            })
-          : prev.calendar_blocks;
+      let resolvedBlockTaskId: string | undefined;
+      let blockReachedCompletion = markCompleted;
+
+      const nextBlocks = prev.calendar_blocks.map((b) => {
+        if (b.id === targetBlockId) {
+          resolvedBlockTaskId = b.taskId;
+          const nextActual = (b.actualMinutes || 0) + loggedMins;
+          const isDone = markCompleted || (loggedMins > 0 && nextActual >= b.durationMinutes);
+          if (isDone) blockReachedCompletion = true;
+          return {
+            ...b,
+            actualMinutes: loggedMins > 0 ? nextActual : b.actualMinutes,
+            completed: isDone ? true : b.completed,
+            updatedAt: loggedMins > 0 || isDone ? nowIso : b.updatedAt,
+          };
+        }
+        if (
+          markCompleted &&
+          !targetBlockId &&
+          timer.taskId &&
+          !b.deleted &&
+          b.taskId === timer.taskId
+        ) {
+          return {
+            ...b,
+            completed: true,
+            updatedAt: nowIso,
+          };
+        }
+        return b;
+      });
+
+      const taskToCompleteId = timer.taskId || resolvedBlockTaskId;
+      if (blockReachedCompletion && taskToCompleteId && nextTasks[taskToCompleteId]) {
+        const existingTask = nextTasks[taskToCompleteId];
+        const effectiveRepeat = normalizeRepeatRule(existingTask.repeat);
+        const shouldSpawnNext =
+          existingTask.status !== 'completed' &&
+          !!effectiveRepeat &&
+          !existingTask.nextOccurrenceSpawned;
+
+        nextTasks[taskToCompleteId] = {
+          ...existingTask,
+          status: 'completed',
+          completedAt: existingTask.completedAt || nowIso,
+          nextOccurrenceSpawned: shouldSpawnNext
+            ? true
+            : existingTask.nextOccurrenceSpawned,
+          updatedAt: nowIso,
+        };
+
+        if (shouldSpawnNext && effectiveRepeat) {
+          const nextId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+          const nextDue = computeNextDueDate(existingTask.due, effectiveRepeat);
+          nextTasks[nextId] = {
+            google_task_id: nextId,
+            subjectId: existingTask.subjectId,
+            title: existingTask.title,
+            notes: existingTask.notes,
+            due: nextDue,
+            status: 'needsAction',
+            estimated_minutes: existingTask.estimated_minutes,
+            logged_minutes: 0,
+            priority: existingTask.priority,
+            repeat: effectiveRepeat,
+            updatedAt: nowIso,
+          };
+        }
+      }
 
       return {
         ...prev,
@@ -808,6 +1054,16 @@ export default function App() {
         study_sessions: [newSession, ...prev.study_sessions],
       };
     }, true);
+
+    if (shouldCompleteLinked && preExistingTask && preExistingTask.googleTaskListId) {
+      syncTaskChangeToGoogleTasks({
+        ...preExistingTask,
+        logged_minutes: (preExistingTask.logged_minutes || 0) + loggedMins,
+        status: 'completed',
+        completedAt: preExistingTask.completedAt || nowIso,
+        updatedAt: nowIso,
+      });
+    }
 
     setShowLogModal(false);
     setTimer((prev) => ({
@@ -832,28 +1088,36 @@ export default function App() {
     const id = `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const nowIso = new Date().toISOString();
     const cleanRepeat = normalizeRepeatRule(input.repeat);
+    const newTask: TaskMetadata = {
+      google_task_id: id,
+      subjectId: input.subjectId,
+      title: input.title,
+      notes: input.notes,
+      due: input.due,
+      status: 'needsAction',
+      estimated_minutes: input.estimatedMinutes,
+      logged_minutes: 0,
+      priority: input.priority,
+      repeat: cleanRepeat,
+      updatedAt: nowIso,
+    };
+
     mutateDb((prev) => ({
       ...prev,
       tasks_metadata: {
         ...prev.tasks_metadata,
-        [id]: {
-          google_task_id: id,
-          subjectId: input.subjectId,
-          title: input.title,
-          notes: input.notes,
-          due: input.due,
-          status: 'needsAction',
-          estimated_minutes: input.estimatedMinutes,
-          logged_minutes: 0,
-          priority: input.priority,
-          repeat: cleanRepeat,
-          updatedAt: nowIso,
-        },
+        [id]: newTask,
       },
     }));
+
+    pushAndPromoteLocalTask(newTask);
   };
 
-  const handleUpdateTask = (taskId: string, patch: Partial<TaskMetadata>) => {
+  const handleUpdateTask = (
+    taskId: string,
+    patch: Partial<TaskMetadata>,
+    syncSource: SyncSource = 'task'
+  ) => {
     const currentTask = dbRef.current.tasks_metadata[taskId];
     const hasRepeatPatch = Object.prototype.hasOwnProperty.call(patch, 'repeat');
     const targetRepeat = normalizeRepeatRule(
@@ -866,12 +1130,47 @@ export default function App() {
       !!targetRepeat &&
       !currentTask.nextOccurrenceSpawned;
 
+    const hasStatusPatch = patch.status !== undefined;
     const hasCalendarFieldChange =
       patch.title !== undefined || patch.subjectId !== undefined;
-    const linkedBlocks = hasCalendarFieldChange
-      ? dbRef.current.calendar_blocks.filter((b) => !b.deleted && b.taskId === taskId)
-      : [];
+    const matchesLinkedOrLegacyBlock = (b: CalendarBlock, refTask: TaskMetadata) =>
+      !b.deleted &&
+      (b.taskId === taskId ||
+        (!b.taskId &&
+          b.title === refTask.title &&
+          b.subjectId === refTask.subjectId));
+    const linkedBlocks =
+      currentTask && (hasCalendarFieldChange || hasStatusPatch)
+        ? dbRef.current.calendar_blocks.filter((b) =>
+            matchesLinkedOrLegacyBlock(b, currentTask)
+          )
+        : [];
     const nowIso = new Date().toISOString();
+
+    let spawnedTaskSnapshot: TaskMetadata | null = null;
+    if (willRollForward && currentTask && targetRepeat) {
+      const nextId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const nextDue = computeNextDueDate(
+        patch.due !== undefined ? patch.due : currentTask.due,
+        targetRepeat
+      );
+      spawnedTaskSnapshot = {
+        google_task_id: nextId,
+        subjectId: patch.subjectId !== undefined ? patch.subjectId : currentTask.subjectId,
+        title: patch.title !== undefined ? patch.title : currentTask.title,
+        notes: patch.notes !== undefined ? patch.notes : currentTask.notes,
+        due: nextDue,
+        status: 'needsAction',
+        estimated_minutes:
+          patch.estimated_minutes !== undefined
+            ? patch.estimated_minutes
+            : currentTask.estimated_minutes,
+        logged_minutes: 0,
+        priority: patch.priority !== undefined ? patch.priority : currentTask.priority,
+        repeat: targetRepeat,
+        updatedAt: nowIso,
+      };
+    }
 
     mutateDb((prev) => {
       const existing = prev.tasks_metadata[taskId];
@@ -900,31 +1199,25 @@ export default function App() {
         [taskId]: updatedExisting,
       };
 
-      if (shouldSpawnNext && effectiveRepeat) {
-        const nextId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        const nextDue = computeNextDueDate(updatedExisting.due, effectiveRepeat);
-        nextTasks[nextId] = {
-          google_task_id: nextId,
-          subjectId: updatedExisting.subjectId,
-          title: updatedExisting.title,
-          notes: updatedExisting.notes,
-          due: nextDue,
-          status: 'needsAction',
-          estimated_minutes: updatedExisting.estimated_minutes,
-          logged_minutes: 0,
-          priority: updatedExisting.priority,
-          repeat: effectiveRepeat,
-          updatedAt: nowIso,
-        };
+      if (shouldSpawnNext && spawnedTaskSnapshot) {
+        nextTasks[spawnedTaskSnapshot.google_task_id] = spawnedTaskSnapshot;
       }
 
-      const nextBlocks = hasCalendarFieldChange
+      const shouldUpdateBlocks =
+        syncSource !== 'calendar' &&
+        syncSource !== 'google_calendar' &&
+        (hasCalendarFieldChange || hasStatusPatch);
+      const nextBlocks = shouldUpdateBlocks
         ? prev.calendar_blocks.map((b) =>
-            !b.deleted && b.taskId === taskId
+            matchesLinkedOrLegacyBlock(b, existing)
               ? {
                   ...b,
+                  taskId,
                   ...(patch.title !== undefined ? { title: patch.title } : {}),
                   ...(patch.subjectId !== undefined ? { subjectId: patch.subjectId } : {}),
+                  ...(hasStatusPatch
+                    ? { completed: patch.status === 'completed' }
+                    : {}),
                   updatedAt: nowIso,
                 }
               : b
@@ -938,11 +1231,17 @@ export default function App() {
       };
     }, willRollForward);
 
-    if (hasCalendarFieldChange && linkedBlocks.length > 0) {
+    if (
+      syncSource !== 'calendar' &&
+      syncSource !== 'google_calendar' &&
+      hasCalendarFieldChange &&
+      linkedBlocks.length > 0
+    ) {
       for (const blk of linkedBlocks) {
         if (!blk.googleEventId) continue;
         const updatedBlk: CalendarBlock = {
           ...blk,
+          taskId,
           ...(patch.title !== undefined ? { title: patch.title } : {}),
           ...(patch.subjectId !== undefined ? { subjectId: patch.subjectId } : {}),
           updatedAt: nowIso,
@@ -967,9 +1266,36 @@ export default function App() {
         });
       }
     }
+
+    if (
+      syncSource !== 'google_tasks' &&
+      currentTask &&
+      currentTask.googleTaskListId &&
+      (patch.status !== undefined ||
+        patch.title !== undefined ||
+        patch.subjectId !== undefined ||
+        patch.due !== undefined ||
+        patch.notes !== undefined ||
+        hasRepeatPatch)
+    ) {
+      syncTaskChangeToGoogleTasks(
+        {
+          ...currentTask,
+          ...patch,
+          repeat: targetRepeat,
+          updatedAt: nowIso,
+        },
+        syncSource
+      );
+    }
+
+    if (spawnedTaskSnapshot) {
+      pushAndPromoteLocalTask(spawnedTaskSnapshot);
+    }
   };
 
   const handleDeleteTask = (taskId: string) => {
+    const existingTask = dbRef.current.tasks_metadata[taskId];
     const linkedBlocks = dbRef.current.calendar_blocks.filter(
       (b) => !b.deleted && b.taskId === taskId
     );
@@ -1005,6 +1331,18 @@ export default function App() {
       };
     });
 
+    if (existingTask?.googleTaskListId) {
+      const listId = existingTask.googleTaskListId;
+      void runCalendarMutation(async (token) => {
+        await deleteGoogleTaskRemote(token, listId, taskId);
+        mutateDb((prev) => {
+          const nextTasks = { ...prev.tasks_metadata };
+          delete nextTasks[taskId];
+          return { ...prev, tasks_metadata: nextTasks };
+        });
+      });
+    }
+
     for (const blk of linkedBlocks) {
       if (!blk.googleEventId) continue;
       const eventId = blk.googleEventId;
@@ -1020,51 +1358,172 @@ export default function App() {
 
   // Calendar Block CRUD
   const handleCreateBlock = (blockInput: Omit<CalendarBlock, 'id' | 'updatedAt'>) => {
+    const nowIso = new Date().toISOString();
+    const blockId = `blk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const shouldCreateParentTask = !blockInput.taskId;
+    const localTaskId = shouldCreateParentTask
+      ? `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+      : blockInput.taskId!;
+
+    const newTask: TaskMetadata | null = shouldCreateParentTask
+      ? {
+          google_task_id: localTaskId,
+          subjectId: blockInput.subjectId,
+          title: blockInput.title,
+          due: blockInput.date,
+          status: 'needsAction',
+          estimated_minutes: Math.max(15, blockInput.durationMinutes),
+          logged_minutes: 0,
+          priority: 'medium',
+          updatedAt: nowIso,
+        }
+      : null;
+
     const newBlock: CalendarBlock = {
       ...blockInput,
-      id: `blk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      updatedAt: new Date().toISOString(),
+      id: blockId,
+      taskId: localTaskId,
+      updatedAt: nowIso,
     };
+
     mutateDb((prev) => ({
       ...prev,
+      tasks_metadata: newTask
+        ? { ...prev.tasks_metadata, [newTask.google_task_id]: newTask }
+        : prev.tasks_metadata,
       calendar_blocks: [...prev.calendar_blocks, newBlock],
     }));
 
-    const subjectName = dbRef.current.subjects.find(
-      (s) => s.id === newBlock.subjectId
-    )?.name;
-    void runCalendarMutation(async (token) => {
-      const googleEventId = await createGoogleCalendarEventForBlock(
-        token,
-        newBlock,
-        subjectName
-      );
-      mutateDb((prev) => ({
-        ...prev,
-        calendar_blocks: prev.calendar_blocks.map((b) =>
-          b.id === newBlock.id ? { ...b, googleEventId } : b
-        ),
-      }));
-    });
+    if (newTask) {
+      pushAndPromoteLocalTask(newTask);
+    }
+
+    if (!newBlock.googleEventId) {
+      const subjectName = dbRef.current.subjects.find(
+        (s) => s.id === newBlock.subjectId
+      )?.name;
+      void runCalendarMutation(async (token) => {
+        const googleEventId = await createGoogleCalendarEventForBlock(
+          token,
+          newBlock,
+          subjectName
+        );
+        mutateDb((prev) => ({
+          ...prev,
+          calendar_blocks: prev.calendar_blocks.map((b) =>
+            b.id === blockId ? { ...b, googleEventId } : b
+          ),
+        }));
+      });
+    }
   };
 
-  const handleUpdateBlock = (blockId: string, patch: Partial<CalendarBlock>) => {
+  const handleUpdateBlock = (
+    blockId: string,
+    patch: Partial<CalendarBlock>,
+    syncSource: SyncSource = 'calendar'
+  ) => {
     const existingBlock = dbRef.current.calendar_blocks.find((b) => b.id === blockId);
     const nowIso = new Date().toISOString();
+    const linkedTaskId = existingBlock?.taskId;
+    const existingLinkedTask = linkedTaskId
+      ? dbRef.current.tasks_metadata[linkedTaskId]
+      : undefined;
 
-    mutateDb((prev) => ({
-      ...prev,
-      calendar_blocks: prev.calendar_blocks.map((b) =>
-        b.id === blockId ? { ...b, ...patch, updatedAt: nowIso } : b
-      ),
-    }));
+    const shouldUpdateDueFromDate =
+      patch.date !== undefined &&
+      !!existingLinkedTask &&
+      (!existingLinkedTask.due || existingLinkedTask.due === existingBlock?.date);
+    const hasLinkedTaskChange =
+      syncSource !== 'task' &&
+      syncSource !== 'google_tasks' &&
+      !!existingLinkedTask &&
+      !existingLinkedTask.deleted &&
+      (patch.title !== undefined ||
+        patch.subjectId !== undefined ||
+        patch.completed !== undefined ||
+        shouldUpdateDueFromDate);
+
+    let spawnedNextTask: TaskMetadata | null = null;
+    if (
+      hasLinkedTaskChange &&
+      existingLinkedTask &&
+      patch.completed === true &&
+      existingLinkedTask.status !== 'completed'
+    ) {
+      const effectiveRepeat = normalizeRepeatRule(existingLinkedTask.repeat);
+      if (effectiveRepeat && !existingLinkedTask.nextOccurrenceSpawned) {
+        const nextId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const baseDue = shouldUpdateDueFromDate ? patch.date : existingLinkedTask.due;
+        spawnedNextTask = {
+          google_task_id: nextId,
+          subjectId:
+            patch.subjectId !== undefined
+              ? patch.subjectId
+              : existingLinkedTask.subjectId,
+          title: patch.title !== undefined ? patch.title : existingLinkedTask.title,
+          notes: existingLinkedTask.notes,
+          due: computeNextDueDate(baseDue, effectiveRepeat),
+          status: 'needsAction',
+          estimated_minutes: existingLinkedTask.estimated_minutes,
+          logged_minutes: 0,
+          priority: existingLinkedTask.priority,
+          repeat: effectiveRepeat,
+          updatedAt: nowIso,
+        };
+      }
+    }
+
+    mutateDb((prev) => {
+      let nextTasks = prev.tasks_metadata;
+      if (hasLinkedTaskChange && linkedTaskId && prev.tasks_metadata[linkedTaskId]) {
+        const t = prev.tasks_metadata[linkedTaskId];
+        const nextStatus =
+          patch.completed !== undefined
+            ? patch.completed
+              ? 'completed'
+              : 'needsAction'
+            : t.status;
+        nextTasks = {
+          ...prev.tasks_metadata,
+          [linkedTaskId]: {
+            ...t,
+            ...(patch.title !== undefined ? { title: patch.title } : {}),
+            ...(patch.subjectId !== undefined ? { subjectId: patch.subjectId } : {}),
+            ...(shouldUpdateDueFromDate ? { due: patch.date } : {}),
+            ...(patch.completed !== undefined
+              ? {
+                  status: nextStatus,
+                  completedAt: patch.completed ? t.completedAt || nowIso : undefined,
+                  nextOccurrenceSpawned: spawnedNextTask
+                    ? true
+                    : t.nextOccurrenceSpawned,
+                }
+              : {}),
+            updatedAt: nowIso,
+          },
+        };
+        if (spawnedNextTask) {
+          nextTasks[spawnedNextTask.google_task_id] = spawnedNextTask;
+        }
+      }
+
+      return {
+        ...prev,
+        tasks_metadata: nextTasks,
+        calendar_blocks: prev.calendar_blocks.map((b) =>
+          b.id === blockId ? { ...b, ...patch, updatedAt: nowIso } : b
+        ),
+      };
+    }, Boolean(spawnedNextTask));
 
     const shouldSyncCalendar =
-      patch.title !== undefined ||
-      patch.date !== undefined ||
-      patch.startMinutes !== undefined ||
-      patch.durationMinutes !== undefined ||
-      patch.subjectId !== undefined;
+      syncSource !== 'google_calendar' &&
+      (patch.title !== undefined ||
+        patch.date !== undefined ||
+        patch.startMinutes !== undefined ||
+        patch.durationMinutes !== undefined ||
+        patch.subjectId !== undefined);
 
     if (existingBlock && !existingBlock.deleted && shouldSyncCalendar) {
       const updatedBlock: CalendarBlock = {
@@ -1091,19 +1550,72 @@ export default function App() {
         }
       });
     }
+
+    if (hasLinkedTaskChange && existingLinkedTask) {
+      const nextStatus =
+        patch.completed !== undefined
+          ? patch.completed
+            ? 'completed'
+            : 'needsAction'
+          : existingLinkedTask.status;
+      const updatedTaskSnapshot: TaskMetadata = {
+        ...existingLinkedTask,
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
+        ...(patch.subjectId !== undefined ? { subjectId: patch.subjectId } : {}),
+        ...(shouldUpdateDueFromDate ? { due: patch.date } : {}),
+        ...(patch.completed !== undefined
+          ? {
+              status: nextStatus,
+              completedAt: patch.completed
+                ? existingLinkedTask.completedAt || nowIso
+                : undefined,
+            }
+          : {}),
+        updatedAt: nowIso,
+      };
+      if (updatedTaskSnapshot.googleTaskListId) {
+        syncTaskChangeToGoogleTasks(updatedTaskSnapshot, syncSource);
+      }
+      if (spawnedNextTask) {
+        pushAndPromoteLocalTask(spawnedNextTask);
+      }
+    }
   };
 
   const handleDeleteBlock = (blockId: string) => {
     const targetBlock = dbRef.current.calendar_blocks.find((b) => b.id === blockId);
+    const linkedTask =
+      targetBlock?.taskId ? dbRef.current.tasks_metadata[targetBlock.taskId] : undefined;
     const nowIso = new Date().toISOString();
 
-    if (targetBlock?.googleEventId) {
-      mutateDb((prev) => ({
+    mutateDb((prev) => {
+      const nextTasks = { ...prev.tasks_metadata };
+      if (linkedTask && !linkedTask.deleted) {
+        if (linkedTask.googleTaskListId) {
+          nextTasks[linkedTask.google_task_id] = {
+            ...linkedTask,
+            deleted: true,
+            updatedAt: nowIso,
+          };
+        } else {
+          delete nextTasks[linkedTask.google_task_id];
+        }
+      }
+
+      const nextBlocks = targetBlock?.googleEventId
+        ? prev.calendar_blocks.map((b) =>
+            b.id === blockId ? { ...b, deleted: true, updatedAt: nowIso } : b
+          )
+        : prev.calendar_blocks.filter((b) => b.id !== blockId);
+
+      return {
         ...prev,
-        calendar_blocks: prev.calendar_blocks.map((b) =>
-          b.id === blockId ? { ...b, deleted: true, updatedAt: nowIso } : b
-        ),
-      }));
+        tasks_metadata: nextTasks,
+        calendar_blocks: nextBlocks,
+      };
+    });
+
+    if (targetBlock?.googleEventId) {
       const eventId = targetBlock.googleEventId;
       void runCalendarMutation(async (token) => {
         await deleteGoogleCalendarEventById(token, eventId);
@@ -1112,13 +1624,20 @@ export default function App() {
           calendar_blocks: prev.calendar_blocks.filter((b) => b.id !== blockId),
         }));
       });
-      return;
     }
 
-    mutateDb((prev) => ({
-      ...prev,
-      calendar_blocks: prev.calendar_blocks.filter((b) => b.id !== blockId),
-    }));
+    if (linkedTask && !linkedTask.deleted && linkedTask.googleTaskListId) {
+      const listId = linkedTask.googleTaskListId;
+      const taskId = linkedTask.google_task_id;
+      void runCalendarMutation(async (token) => {
+        await deleteGoogleTaskRemote(token, listId, taskId);
+        mutateDb((prev) => {
+          const nextTasks = { ...prev.tasks_metadata };
+          delete nextTasks[taskId];
+          return { ...prev, tasks_metadata: nextTasks };
+        });
+      });
+    }
   };
 
   const handleScheduleTask = (
@@ -1654,6 +2173,44 @@ export default function App() {
             </div>
           </div>
         )}
+        {syncStatus.errorMessage && !dismissedErrorBanner && (
+          <div className="mx-auto max-w-[1600px] px-4 sm:px-6 pt-3" role="alert">
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-rose-200 dark:border-rose-900/60 bg-rose-50/95 dark:bg-rose-950/40 px-3.5 py-2.5 text-xs text-rose-900 dark:text-rose-200">
+              <div className="flex items-start gap-2 min-w-0 flex-1">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-600 dark:text-rose-400" />
+                <span className="break-words">{syncStatus.errorMessage}</span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0 ml-auto">
+                {isGoogleConnected ? (
+                  <button
+                    type="button"
+                    onClick={() => void runSync()}
+                    disabled={syncStatus.state === 'syncing'}
+                    className="rounded-lg bg-rose-600 hover:bg-rose-700 disabled:opacity-60 px-2.5 py-1 text-xs font-medium text-white transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    {syncStatus.state === 'syncing' ? 'Retrying...' : 'Retry Sync'}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setShowSetupModal(true)}
+                    className="rounded-lg bg-rose-600 hover:bg-rose-700 px-2.5 py-1 text-xs font-medium text-white transition-colors cursor-pointer whitespace-nowrap"
+                  >
+                    Preferences
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setDismissedErrorBanner(true)}
+                  className="p-1 rounded-md text-rose-700/70 hover:text-rose-900 dark:text-rose-300/70 dark:hover:text-rose-100 cursor-pointer"
+                  aria-label="Dismiss sync error notice"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         {activeTab === 'workspace' && (
           <TimeBlockingCalendar
             weekStart={weekStart}
@@ -2007,6 +2564,12 @@ export default function App() {
         title={timer.title}
         subjectName={activeSubject?.name || 'No Subject'}
         durationSeconds={Math.round(elapsedMs / 1000)}
+        hasLinkedTarget={Boolean(timer.taskId || timer.calendarBlockId)}
+        defaultMarkCompleted={Boolean(
+          (timer.taskId || timer.calendarBlockId) &&
+            timer.targetDurationMs > 0 &&
+            elapsedMs >= timer.targetDurationMs
+        )}
         onSave={handleSaveSession}
         onDiscard={() => {
           setShowLogModal(false);

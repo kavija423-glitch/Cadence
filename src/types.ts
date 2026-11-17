@@ -219,3 +219,10 @@ export type MainTab =
   | 'papers'
   | 'syllabus';
 export type TaskFilter = 'today' | 'upcoming' | 'unscheduled' | 'completed' | 'all';
+
+export type SyncSource =
+  | 'calendar'
+  | 'task'
+  | 'google_calendar'
+  | 'google_tasks'
+  | 'timer';

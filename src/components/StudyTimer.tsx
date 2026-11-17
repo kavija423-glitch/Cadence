@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Play,
   Pause,
@@ -453,12 +453,31 @@ export const SessionCompleteModal: React.FC<{
   title: string;
   subjectName: string;
   durationSeconds: number;
-  onSave: (rating: 1 | 2 | 3 | 4 | 5, notes: string) => void;
+  hasLinkedTarget?: boolean;
+  defaultMarkCompleted?: boolean;
+  onSave: (rating: 1 | 2 | 3 | 4 | 5, notes: string, markCompleted: boolean) => void;
   onDiscard: () => void;
   onCancel: () => void;
-}> = ({ isOpen, title, subjectName, durationSeconds, onSave, onDiscard, onCancel }) => {
+}> = ({
+  isOpen,
+  title,
+  subjectName,
+  durationSeconds,
+  hasLinkedTarget = false,
+  defaultMarkCompleted = false,
+  onSave,
+  onDiscard,
+  onCancel,
+}) => {
   const [rating, setRating] = useState<1 | 2 | 3 | 4 | 5>(4);
   const [notes, setNotes] = useState('');
+  const [markCompleted, setMarkCompleted] = useState(defaultMarkCompleted);
+
+  useEffect(() => {
+    if (isOpen) {
+      setMarkCompleted(defaultMarkCompleted);
+    }
+  }, [isOpen, defaultMarkCompleted]);
 
   if (!isOpen) return null;
 
@@ -532,6 +551,18 @@ export const SessionCompleteModal: React.FC<{
           />
         </div>
 
+        {hasLinkedTarget && (
+          <label className="flex items-center gap-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/50 px-3 py-2.5 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={markCompleted}
+              onChange={(e) => setMarkCompleted(e.target.checked)}
+              className="h-4 w-4 rounded border-slate-300 dark:border-slate-600 text-blue-600 focus:ring-blue-600"
+            />
+            <span>Mark linked task &amp; block as completed</span>
+          </label>
+        )}
+
         <div className="flex items-center justify-between gap-2 pt-1">
           <button
             type="button"
@@ -551,7 +582,7 @@ export const SessionCompleteModal: React.FC<{
             <button
               type="button"
               onClick={() => {
-                onSave(rating, notes.trim());
+                onSave(rating, notes.trim(), markCompleted);
                 setNotes('');
               }}
               className="rounded-xl bg-blue-600 hover:bg-blue-700 px-4 py-2 text-xs font-semibold text-white cursor-pointer"

@@ -6,6 +6,7 @@ import type {
   StudyDatabase,
   Subject,
   SyllabusSubtopicProgress,
+  SyncSource,
   TaskMetadata,
 } from '../types';
 import { toLocalDateKey } from '../utils/dateUtils';
@@ -590,6 +591,23 @@ async function googleFetch(
   return res;
 }
 
+function parseGoogleApiErrorMessage(errText: string): string {
+  if (!errText) return '';
+  try {
+    const parsed = JSON.parse(errText) as {
+      error?: {
+        message?: string;
+        errors?: Array<{ message?: string; reason?: string }>;
+      };
+    };
+    const msg = parsed?.error?.message || parsed?.error?.errors?.[0]?.message;
+    if (msg) return msg;
+  } catch {
+    // Non-JSON response body
+  }
+  return errText.replace(/\s+/g, ' ').trim().slice(0, 240);
+}
+
 function isInsufficientScope403(status: number, bodyText: string): boolean {
   if (status !== 403) return false;
   const lower = bodyText.toLowerCase();
@@ -794,13 +812,22 @@ export function mergeStudyDatabases(local: StudyDatabase, remote: StudyDatabase)
     }
   }
 
-  // Merge calendar_blocks by id
+  // Merge calendar_blocks by id, preserving any synced googleEventId across merges
   const blockMap = new Map<string, CalendarBlock>();
   for (const b of remote.calendar_blocks || []) blockMap.set(b.id, b);
   for (const b of local.calendar_blocks || []) {
     const existing = blockMap.get(b.id);
-    if (!existing || new Date(b.updatedAt).getTime() >= new Date(existing.updatedAt).getTime()) {
+    if (!existing) {
       blockMap.set(b.id, b);
+    } else {
+      const chosen =
+        new Date(b.updatedAt).getTime() >= new Date(existing.updatedAt).getTime()
+          ? b
+          : existing;
+      blockMap.set(b.id, {
+        ...chosen,
+        googleEventId: chosen.googleEventId || existing.googleEventId || b.googleEventId,
+      });
     }
   }
 
@@ -915,7 +942,7 @@ interface GoogleTaskItem {
 async function syncGoogleTasksBidirectional(
   token: string,
   db: StudyDatabase
-): Promise<StudyDatabase> {
+): Promise<{ db: StudyDatabase; syncOriginByTaskId: Record<string, SyncSource> }> {
   const listsRes = await googleFetch(
     'https://tasks.googleapis.com/tasks/v1/users/@me/lists?maxResults=100',
     token
@@ -928,6 +955,7 @@ async function syncGoogleTasksBidirectional(
 
   const updatedSubjects = [...db.subjects];
   const updatedTasks: Record<string, TaskMetadata> = { ...db.tasks_metadata };
+  const syncOriginByTaskId: Record<string, SyncSource> = {};
   let updatedBlocks = [...db.calendar_blocks];
   let updatedSessions = [...db.study_sessions];
 
@@ -1031,18 +1059,40 @@ async function syncGoogleTasksBidirectional(
           delete updatedTasks[rt.id];
         } else if (remoteUpdatedMs > localUpdatedMs + 1500) {
           // Remote is newer -> update core fields, preserve study metadata
+          const nextTitle = rt.title || existing.title;
+          const nextStatus = rt.status;
+          const nextUpdatedAt = rt.updated || existing.updatedAt;
           updatedTasks[rt.id] = {
             ...existing,
             googleTaskListId: listId,
             subjectId: subj.id,
-            title: rt.title || existing.title,
+            title: nextTitle,
             notes: rt.notes !== undefined ? cleanNotes : existing.notes,
             due: remoteDue,
-            status: rt.status,
+            status: nextStatus,
             completedAt: rt.completed ?? existing.completedAt,
             repeat: parsedRepeat ?? (rt.notes !== undefined ? undefined : existing.repeat),
-            updatedAt: rt.updated || existing.updatedAt,
+            updatedAt: nextUpdatedAt,
           };
+          syncOriginByTaskId[rt.id] = 'google_tasks';
+
+          if (
+            nextTitle !== existing.title ||
+            subj.id !== existing.subjectId ||
+            nextStatus !== existing.status
+          ) {
+            updatedBlocks = updatedBlocks.map((b) =>
+              !b.deleted && b.taskId === rt.id
+                ? {
+                    ...b,
+                    title: nextTitle,
+                    subjectId: subj.id,
+                    completed: nextStatus === 'completed',
+                    updatedAt: nextUpdatedAt,
+                  }
+                : b
+            );
+          }
         } else if (localUpdatedMs > remoteUpdatedMs + 1500) {
           // Local is newer -> push PATCH to Google Tasks
           await googleFetch(
@@ -1059,6 +1109,10 @@ async function syncGoogleTasksBidirectional(
                 notes: syncRepeatMetadataInNotes(existing.notes, existing.repeat),
                 status: existing.status,
                 due: existing.due ? `${existing.due}T00:00:00.000Z` : null,
+                completed:
+                  existing.status === 'completed'
+                    ? existing.completedAt || new Date().toISOString()
+                    : null,
               }),
             }
           );
@@ -1113,12 +1167,195 @@ async function syncGoogleTasksBidirectional(
   }
 
   return {
-    ...db,
-    subjects: updatedSubjects,
-    tasks_metadata: updatedTasks,
-    calendar_blocks: updatedBlocks,
-    study_sessions: updatedSessions,
-    modifiedTime: new Date().toISOString(),
+    db: {
+      ...db,
+      subjects: updatedSubjects,
+      tasks_metadata: updatedTasks,
+      calendar_blocks: updatedBlocks,
+      study_sessions: updatedSessions,
+      modifiedTime: new Date().toISOString(),
+    },
+    syncOriginByTaskId,
+  };
+}
+
+export async function resolveGoogleTaskListIdForSubject(
+  token: string,
+  subject?: Subject
+): Promise<string> {
+  if (subject?.googleTaskListId) {
+    return subject.googleTaskListId;
+  }
+
+  if (!subject) {
+    return '@default';
+  }
+
+  const listsRes = await googleFetch(
+    'https://tasks.googleapis.com/tasks/v1/users/@me/lists?maxResults=100',
+    token
+  );
+  if (listsRes.ok) {
+    const listsData = (await listsRes.json()) as { items?: GoogleTaskList[] };
+    const matched = (listsData.items || []).find(
+      (list) => list.title.trim().toLowerCase() === subject.name.trim().toLowerCase()
+    );
+    if (matched) {
+      return matched.id;
+    }
+  }
+
+  const createListRes = await googleFetch(
+    'https://tasks.googleapis.com/tasks/v1/users/@me/lists',
+    token,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: subject.name }),
+    }
+  );
+  if (!createListRes.ok) {
+    return '@default';
+  }
+  const created = (await createListRes.json()) as GoogleTaskList;
+  return created.id;
+}
+
+export async function createGoogleTaskRemote(
+  token: string,
+  task: TaskMetadata,
+  subject?: Subject
+): Promise<{
+  googleTaskId: string;
+  googleTaskListId: string;
+  updatedAt: string;
+}> {
+  const listId = await resolveGoogleTaskListIdForSubject(token, subject);
+  const serializedNotes = syncRepeatMetadataInNotes(task.notes, task.repeat);
+
+  const createRes = await googleFetch(
+    `https://tasks.googleapis.com/tasks/v1/lists/${encodeURIComponent(listId)}/tasks`,
+    token,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: task.title,
+        notes: serializedNotes || undefined,
+        status: task.status,
+        due: task.due ? `${task.due}T00:00:00.000Z` : undefined,
+        ...(task.status === 'completed'
+          ? { completed: task.completedAt || new Date().toISOString() }
+          : {}),
+      }),
+    }
+  );
+
+  if (!createRes.ok) {
+    const errText = await createRes.text().catch(() => '');
+    throw new Error(`Google Task create failed (${createRes.status}): ${errText}`);
+  }
+
+  const created = (await createRes.json()) as GoogleTaskItem;
+  return {
+    googleTaskId: created.id,
+    googleTaskListId: listId,
+    updatedAt: created.updated || task.updatedAt,
+  };
+}
+
+export async function deleteGoogleTaskRemote(
+  token: string,
+  googleTaskListId: string,
+  googleTaskId: string
+): Promise<void> {
+  const res = await googleFetch(
+    `https://tasks.googleapis.com/tasks/v1/lists/${encodeURIComponent(
+      googleTaskListId
+    )}/tasks/${encodeURIComponent(googleTaskId)}`,
+    token,
+    { method: 'DELETE' }
+  );
+
+  if (res.status === 404 || res.status === 410) {
+    return;
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Google Task delete failed (${res.status}): ${errText}`);
+  }
+}
+
+export async function updateGoogleTaskRemote(
+  token: string,
+  task: TaskMetadata,
+  subject?: Subject,
+  options?: { syncSource?: SyncSource }
+): Promise<{
+  googleTaskId: string;
+  googleTaskListId: string;
+  updatedAt: string;
+  syncSource?: SyncSource;
+}> {
+  const syncSource = options?.syncSource;
+  if (!task.googleTaskListId) {
+    const created = await createGoogleTaskRemote(token, task, subject);
+    return { ...created, syncSource };
+  }
+
+  const targetListId = subject
+    ? await resolveGoogleTaskListIdForSubject(token, subject)
+    : task.googleTaskListId;
+
+  // If the user moved the task/block to a different subject's Google Task list, move it cleanly
+  if (targetListId !== task.googleTaskListId) {
+    await deleteGoogleTaskRemote(token, task.googleTaskListId, task.google_task_id);
+    return createGoogleTaskRemote(
+      token,
+      { ...task, googleTaskListId: targetListId },
+      subject
+    );
+  }
+
+  const serializedNotes = syncRepeatMetadataInNotes(task.notes, task.repeat);
+  const res = await googleFetch(
+    `https://tasks.googleapis.com/tasks/v1/lists/${encodeURIComponent(
+      task.googleTaskListId
+    )}/tasks/${encodeURIComponent(task.google_task_id)}`,
+    token,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: task.google_task_id,
+        title: task.title,
+        notes: serializedNotes || null,
+        status: task.status,
+        due: task.due ? `${task.due}T00:00:00.000Z` : null,
+        completed:
+          task.status === 'completed'
+            ? task.completedAt || new Date().toISOString()
+            : null,
+      }),
+    }
+  );
+
+  if (res.status === 404 || res.status === 410) {
+    return createGoogleTaskRemote(token, task, subject);
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Google Task update failed (${res.status}): ${errText}`);
+  }
+
+  const updated = (await res.json()) as GoogleTaskItem;
+  return {
+    googleTaskId: updated.id || task.google_task_id,
+    googleTaskListId: task.googleTaskListId,
+    updatedAt: updated.updated || task.updatedAt,
+    syncSource,
   };
 }
 
@@ -1148,19 +1385,37 @@ function formatLocalRfc3339(dt: Date): string {
 }
 
 function buildGoogleCalendarEventBody(block: CalendarBlock, subjectName?: string) {
-  const [y, m, d] = block.date.split('-').map(Number);
-  const startLocal = new Date(y, (m || 1) - 1, d || 1, 0, block.startMinutes, 0, 0);
-  const endLocal = new Date(
-    startLocal.getTime() + Math.max(15, block.durationMinutes) * 60_000
+  const parts = (block.date || '').split('-').map(Number);
+  const [y, m, d] = parts;
+  if (
+    parts.length !== 3 ||
+    !Number.isInteger(y) ||
+    !Number.isInteger(m) ||
+    !Number.isInteger(d) ||
+    m < 1 ||
+    m > 12 ||
+    d < 1 ||
+    d > 31
+  ) {
+    throw new Error(
+      `Invalid study block date "${block.date}" for "${block.title || 'Study Block'}".`
+    );
+  }
+  const safeStartMin = Number.isFinite(block.startMinutes) ? block.startMinutes : 9 * 60;
+  const safeDurationMin = Math.max(
+    15,
+    Number.isFinite(block.durationMinutes) ? block.durationMinutes : 30
   );
-  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const startLocal = new Date(y, m - 1, d, 0, safeStartMin, 0, 0);
+  const endLocal = new Date(startLocal.getTime() + safeDurationMin * 60_000);
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Colombo';
   const descriptionParts = [
     subjectName ? `Subject: ${subjectName}` : null,
     'Scheduled in Cadence',
   ].filter(Boolean);
 
   return {
-    summary: block.title,
+    summary: (block.title || '').trim() || 'Study Block',
     description: descriptionParts.join('\n'),
     start: {
       dateTime: formatLocalRfc3339(startLocal),
@@ -1184,20 +1439,27 @@ export async function createGoogleCalendarEventForBlock(
   block: CalendarBlock,
   subjectName?: string
 ): Promise<string> {
+  const payload = buildGoogleCalendarEventBody(block, subjectName);
   const res = await googleCalendarWriteFetch(
     'https://www.googleapis.com/calendar/v3/calendars/primary/events',
     token,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(buildGoogleCalendarEventBody(block, subjectName)),
+      body: JSON.stringify(payload),
     }
   );
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
-    throw new Error(`Calendar event create failed (${res.status}): ${errText}`);
+    const detail = parseGoogleApiErrorMessage(errText);
+    throw new Error(
+      `Calendar event create failed (${res.status})${detail ? `: ${detail}` : ''}`
+    );
   }
-  const created = (await res.json()) as { id: string };
+  const created = (await res.json()) as { id?: string };
+  if (!created.id) {
+    throw new Error('Google Calendar created the event but did not return an event ID.');
+  }
   return created.id;
 }
 
@@ -1210,6 +1472,7 @@ export async function updateGoogleCalendarEventForBlock(
     return createGoogleCalendarEventForBlock(token, block, subjectName);
   }
 
+  const payload = buildGoogleCalendarEventBody(block, subjectName);
   const res = await googleCalendarWriteFetch(
     `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(
       block.googleEventId
@@ -1218,7 +1481,7 @@ export async function updateGoogleCalendarEventForBlock(
     {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(buildGoogleCalendarEventBody(block, subjectName)),
+      body: JSON.stringify(payload),
     }
   );
 
@@ -1228,7 +1491,10 @@ export async function updateGoogleCalendarEventForBlock(
 
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
-    throw new Error(`Calendar event update failed (${res.status}): ${errText}`);
+    const detail = parseGoogleApiErrorMessage(errText);
+    throw new Error(
+      `Calendar event update failed (${res.status})${detail ? `: ${detail}` : ''}`
+    );
   }
 
   return block.googleEventId;
@@ -1252,7 +1518,10 @@ export async function deleteGoogleCalendarEventById(
 
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
-    throw new Error(`Calendar event delete failed (${res.status}): ${errText}`);
+    const detail = parseGoogleApiErrorMessage(errText);
+    throw new Error(
+      `Calendar event delete failed (${res.status})${detail ? `: ${detail}` : ''}`
+    );
   }
 }
 
@@ -1334,30 +1603,60 @@ export async function fetchGoogleCalendarOverlay(
 async function syncGoogleCalendarBlocksBidirectional(
   token: string,
   db: StudyDatabase,
-  weekOverlays: GoogleCalendarEventOverlay[]
-): Promise<{ db: StudyDatabase; didMutateRemote: boolean }> {
-  const subjectNameById = new Map(db.subjects.map((s) => [s.id, s.name]));
+  weekOverlays: GoogleCalendarEventOverlay[],
+  syncOriginByTaskId: Record<string, SyncSource> = {}
+): Promise<{ db: StudyDatabase; didMutateRemote: boolean; calendarSyncErrors: string[] }> {
+  const subjectById = new Map(db.subjects.map((s) => [s.id, s]));
   const overlayById = new Map(weekOverlays.map((ev) => [ev.id, ev]));
   const nextBlocks: CalendarBlock[] = [];
+  const updatedTasks: Record<string, TaskMetadata> = { ...db.tasks_metadata };
+  const calendarSyncErrors: string[] = [];
   let didMutateRemote = false;
 
   for (const block of db.calendar_blocks) {
     if (block.deleted) {
       if (block.googleEventId) {
-        await deleteGoogleCalendarEventById(token, block.googleEventId);
-        didMutateRemote = true;
+        try {
+          await deleteGoogleCalendarEventById(token, block.googleEventId);
+          didMutateRemote = true;
+        } catch (err) {
+          if (
+            err instanceof GoogleCalendarScopeUpgradeRequiredError ||
+            err instanceof GoogleAuthInteractionRequiredError
+          ) {
+            throw err;
+          }
+          calendarSyncErrors.push(
+            err instanceof Error ? err.message : `Failed to delete Calendar event for "${block.title}".`
+          );
+          nextBlocks.push(block);
+        }
       }
       continue;
     }
 
-    const subjName = subjectNameById.get(block.subjectId);
+    const subjName = subjectById.get(block.subjectId)?.name;
+
+    // Backfill any non-tombstoned local CalendarBlock without a googleEventId
     if (!block.googleEventId) {
-      const createdId = await createGoogleCalendarEventForBlock(token, block, subjName);
-      didMutateRemote = true;
-      nextBlocks.push({
-        ...block,
-        googleEventId: createdId,
-      });
+      try {
+        const createdId = await createGoogleCalendarEventForBlock(token, block, subjName);
+        didMutateRemote = true;
+        nextBlocks.push({
+          ...block,
+          googleEventId: createdId,
+        });
+      } catch (err) {
+        if (
+          err instanceof GoogleCalendarScopeUpgradeRequiredError ||
+          err instanceof GoogleAuthInteractionRequiredError
+        ) {
+          throw err;
+        }
+        const msg = err instanceof Error ? err.message : 'Calendar event creation failed.';
+        calendarSyncErrors.push(`"${block.title || 'Study Block'}" (${block.date}): ${msg}`);
+        nextBlocks.push(block);
+      }
       continue;
     }
 
@@ -1367,23 +1666,98 @@ async function syncGoogleCalendarBlocksBidirectional(
       const localMs = new Date(block.updatedAt || 0).getTime();
 
       if (remoteMs > localMs + 1500) {
+        const nextTitle = remoteEv.summary || block.title;
+        const nextDate = remoteEv.date;
+        const hasRemoteDiff =
+          nextTitle !== block.title ||
+          nextDate !== block.date ||
+          remoteEv.startMinutes !== block.startMinutes ||
+          remoteEv.durationMinutes !== block.durationMinutes;
+
         nextBlocks.push({
           ...block,
-          title: remoteEv.summary || block.title,
-          date: remoteEv.date,
+          title: nextTitle,
+          date: nextDate,
           startMinutes: remoteEv.startMinutes,
           durationMinutes: remoteEv.durationMinutes,
           updatedAt: remoteEv.updated,
         });
+
+        // Reverse sync renamed block title to parent task + Google Tasks API, guarded by syncSource
+        const syncSource: SyncSource = 'google_calendar';
+        if (
+          hasRemoteDiff &&
+          block.taskId &&
+          syncOriginByTaskId[block.taskId] !== 'google_tasks'
+        ) {
+          const parentTask = updatedTasks[block.taskId];
+          if (parentTask && !parentTask.deleted) {
+            const titleChanged = nextTitle !== parentTask.title;
+            const shouldSyncDue =
+              nextDate !== block.date && (!parentTask.due || parentTask.due === block.date);
+
+            if (titleChanged || shouldSyncDue) {
+              const updatedParentTask: TaskMetadata = {
+                ...parentTask,
+                ...(titleChanged ? { title: nextTitle } : {}),
+                ...(shouldSyncDue ? { due: nextDate } : {}),
+                updatedAt: remoteEv.updated,
+              };
+              const taskSubject = subjectById.get(updatedParentTask.subjectId);
+              try {
+                const pushed = await updateGoogleTaskRemote(
+                  token,
+                  updatedParentTask,
+                  taskSubject,
+                  { syncSource }
+                );
+                if (pushed.googleTaskId !== block.taskId) {
+                  delete updatedTasks[block.taskId];
+                  nextBlocks[nextBlocks.length - 1] = {
+                    ...nextBlocks[nextBlocks.length - 1],
+                    taskId: pushed.googleTaskId,
+                  };
+                }
+                updatedTasks[pushed.googleTaskId] = {
+                  ...updatedParentTask,
+                  google_task_id: pushed.googleTaskId,
+                  googleTaskListId: pushed.googleTaskListId,
+                  updatedAt: pushed.updatedAt,
+                };
+              } catch (err) {
+                if (
+                  err instanceof GoogleCalendarScopeUpgradeRequiredError ||
+                  err instanceof GoogleAuthInteractionRequiredError
+                ) {
+                  throw err;
+                }
+                const msg = err instanceof Error ? err.message : 'Google Task reverse sync failed.';
+                calendarSyncErrors.push(`"${nextTitle}": ${msg}`);
+              }
+            }
+          }
+        }
         continue;
       }
 
       if (localMs > remoteMs + 1500) {
-        const returnedId = await updateGoogleCalendarEventForBlock(token, block, subjName);
-        didMutateRemote = true;
-        nextBlocks.push(
-          returnedId !== block.googleEventId ? { ...block, googleEventId: returnedId } : block
-        );
+        try {
+          const returnedId = await updateGoogleCalendarEventForBlock(token, block, subjName);
+          didMutateRemote = true;
+          nextBlocks.push(
+            returnedId !== block.googleEventId ? { ...block, googleEventId: returnedId } : block
+          );
+        } catch (err) {
+          if (
+            err instanceof GoogleCalendarScopeUpgradeRequiredError ||
+            err instanceof GoogleAuthInteractionRequiredError
+          ) {
+            throw err;
+          }
+          const msg = err instanceof Error ? err.message : 'Calendar event update failed.';
+          calendarSyncErrors.push(`"${block.title || 'Study Block'}" (${block.date}): ${msg}`);
+          nextBlocks.push(block);
+        }
         continue;
       }
     }
@@ -1394,9 +1768,11 @@ async function syncGoogleCalendarBlocksBidirectional(
   return {
     db: {
       ...db,
+      tasks_metadata: updatedTasks,
       calendar_blocks: nextBlocks,
     },
     didMutateRemote,
+    calendarSyncErrors,
   };
 }
 
@@ -1417,6 +1793,7 @@ export async function performFullGoogleSync(params: {
   remoteFileId: string;
   remoteModifiedTime: string;
   calendarEvents: GoogleCalendarEventOverlay[];
+  calendarSyncErrors: string[];
 }> {
   const {
     token,
@@ -1468,14 +1845,16 @@ export async function performFullGoogleSync(params: {
   }
 
   // Step 2: Two-way Google Tasks Sync
-  workingDb = await syncGoogleTasksBidirectional(token, workingDb);
+  const tasksSyncResult = await syncGoogleTasksBidirectional(token, workingDb);
+  workingDb = tasksSyncResult.db;
 
-  // Step 3: Two-way Google Calendar Sync for study time blocks
+  // Step 3: Two-way Google Calendar Sync (including backfilling unsynced local blocks)
   let calendarEvents = await fetchGoogleCalendarOverlay(token, weekStart, weekEnd);
   const calendarSyncResult = await syncGoogleCalendarBlocksBidirectional(
     token,
     workingDb,
-    calendarEvents
+    calendarEvents,
+    tasksSyncResult.syncOriginByTaskId
   );
   workingDb = calendarSyncResult.db;
 
@@ -1495,6 +1874,7 @@ export async function performFullGoogleSync(params: {
     remoteFileId: savedMeta.id,
     remoteModifiedTime: savedMeta.modifiedTime,
     calendarEvents,
+    calendarSyncErrors: calendarSyncResult.calendarSyncErrors,
   };
 }
 
