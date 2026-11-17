@@ -10,13 +10,16 @@ import {
   Settings,
   AlertCircle,
   X,
+  FileText,
 } from 'lucide-react';
 import type {
+  ALSubjectKey,
   ActiveTimerSnapshot,
   CalendarBlock,
   ExamCountdown,
   GoogleCalendarEventOverlay,
   MainTab,
+  PastPaperRecord,
   Priority,
   RepeatRule,
   StudyDatabase,
@@ -62,6 +65,12 @@ import {
   StudyTimerFocusView,
 } from './components/StudyTimer';
 import { AnalyticsDashboard } from './components/AnalyticsDashboard';
+import { PapersView } from './components/PapersView';
+import {
+  AL_SUBJECT_CONFIGS,
+  findMatchingUserSubject,
+  type RedoQueueEntry,
+} from './utils/pastPapers';
 
 const DB_STORAGE_KEY = 'cadence_study_db_v1';
 const TIMER_STORAGE_KEY = 'cadence_active_timer_v1';
@@ -72,7 +81,10 @@ function loadDatabase(): StudyDatabase {
     if (raw) {
       const parsed = JSON.parse(raw) as StudyDatabase;
       if (parsed && Array.isArray(parsed.subjects) && parsed.tasks_metadata) {
-        return parsed;
+        return {
+          ...parsed,
+          pastPapers: Array.isArray(parsed.pastPapers) ? parsed.pastPapers : [],
+        };
       }
     }
   } catch {
@@ -883,7 +895,176 @@ export default function App() {
     if (!parsed || !Array.isArray(parsed.subjects) || !parsed.tasks_metadata) {
       throw new Error('File does not match Cadence study_sync.json schema.');
     }
-    mutateDb(() => parsed, true);
+    mutateDb(
+      () => ({
+        ...parsed,
+        pastPapers: Array.isArray(parsed.pastPapers) ? parsed.pastPapers : [],
+      }),
+      true
+    );
+  };
+
+  // Past Papers CRUD & Cadence Task / Timer Integration
+  const handleCreatePaper = (paper: PastPaperRecord) => {
+    mutateDb((prev) => ({
+      ...prev,
+      pastPapers: [paper, ...(prev.pastPapers || [])],
+    }));
+  };
+
+  const handleUpdatePaper = (
+    paperId: string,
+    updater: (prev: PastPaperRecord) => PastPaperRecord
+  ) => {
+    mutateDb((prev) => ({
+      ...prev,
+      pastPapers: (prev.pastPapers || []).map((p) =>
+        p.id === paperId ? updater(p) : p
+      ),
+    }));
+  };
+
+  const handleDeletePaper = (paperId: string) => {
+    const nowIso = new Date().toISOString();
+    mutateDb((prev) => ({
+      ...prev,
+      pastPapers: (prev.pastPapers || []).map((p) =>
+        p.id === paperId ? { ...p, deleted: true, updatedAt: nowIso } : p
+      ),
+    }));
+  };
+
+  const pushPaperTaskToBacklog = (params: {
+    subject: ALSubjectKey;
+    title: string;
+    estimatedMinutes: number;
+    notes?: string;
+  }) => {
+    const nowIso = new Date().toISOString();
+    const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const todayDue = toLocalDateKey(new Date());
+
+    mutateDb((prev) => {
+      const matched = findMatchingUserSubject(params.subject, prev.subjects);
+      let resolvedSubjectId = matched?.id || '';
+      let nextSubjects = prev.subjects;
+
+      if (!matched) {
+        const cfg = AL_SUBJECT_CONFIGS[params.subject];
+        const newSubjId = `subj-${params.subject}-${Date.now()}`;
+        resolvedSubjectId = newSubjId;
+        nextSubjects = [
+          ...prev.subjects,
+          {
+            id: newSubjId,
+            name: cfg.label,
+            color: cfg.defaultColor,
+            updatedAt: nowIso,
+          },
+        ];
+      }
+
+      return {
+        ...prev,
+        subjects: nextSubjects,
+        tasks_metadata: {
+          ...prev.tasks_metadata,
+          [taskId]: {
+            google_task_id: taskId,
+            subjectId: resolvedSubjectId,
+            title: params.title,
+            notes: params.notes,
+            due: todayDue,
+            status: 'needsAction',
+            estimated_minutes: params.estimatedMinutes,
+            logged_minutes: 0,
+            priority: 'high',
+            updatedAt: nowIso,
+          },
+        },
+      };
+    });
+  };
+
+  const handleSendPaperQuestionToTasks = (params: {
+    subject: ALSubjectKey;
+    paperTitle: string;
+    questionCode: string;
+    syllabusUnit?: string;
+    mistakeNote?: string;
+  }) => {
+    const cfg = AL_SUBJECT_CONFIGS[params.subject];
+    const unitPart = params.syllabusUnit ? ` (${params.syllabusUnit})` : '';
+    const title = `Redo ${cfg.shortLabel} ${params.paperTitle} ${params.questionCode}${unitPart}`;
+    pushPaperTaskToBacklog({
+      subject: params.subject,
+      title,
+      estimatedMinutes: 30,
+      notes: params.mistakeNote || undefined,
+    });
+  };
+
+  const handleSendPaperBatchToTasks = (entries: RedoQueueEntry[]) => {
+    if (entries.length === 0) return;
+    const primarySubject = entries[0].subject;
+    const cfg = AL_SUBJECT_CONFIGS[primarySubject];
+    const uniquePapers = Array.from(new Set(entries.map((e) => e.paperTitle)));
+    const uniqueUnits = Array.from(
+      new Set(entries.map((e) => e.syllabusUnit).filter(Boolean))
+    ) as string[];
+    const codes = entries
+      .slice(0, 4)
+      .map((e) => e.displayCode)
+      .join(', ');
+    const extra = entries.length > 4 ? ` +${entries.length - 4} more` : '';
+    const paperSegment =
+      uniquePapers.length === 1 ? ` ${uniquePapers[0]}` : '';
+    const unitSegment =
+      uniqueUnits.length === 1 ? ` (${uniqueUnits[0]})` : '';
+    const title = `Redo ${cfg.shortLabel}${paperSegment} ${codes}${extra}${unitSegment}`;
+    const estimatedMinutes = Math.min(
+      180,
+      Math.max(30, Math.ceil((entries.length * 15) / 15) * 15)
+    );
+    const notes = entries
+      .map(
+        (e) =>
+          `• ${e.paperTitle} ${e.displayCode}${
+            e.syllabusUnit ? ` [${e.syllabusUnit}]` : ''
+          }${e.mistakeNote ? `: ${e.mistakeNote}` : ''}`
+      )
+      .join('\n');
+
+    pushPaperTaskToBacklog({
+      subject: primarySubject,
+      title,
+      estimatedMinutes,
+      notes,
+    });
+  };
+
+  const handleStartRedoTimer = (params: {
+    subject: ALSubjectKey;
+    title: string;
+  }) => {
+    const matched = findMatchingUserSubject(params.subject, dbRef.current.subjects);
+    const presetMode =
+      dbRef.current.settings.pomodoroPreset === '50_10'
+        ? 'pomodoro_50'
+        : 'pomodoro_25';
+    const targetMs =
+      (presetMode === 'pomodoro_50' ? 50 : 25) * 60 * 1000;
+
+    setTimer({
+      mode: presetMode,
+      phase: 'focus',
+      status: 'running',
+      startedAtMs: Date.now(),
+      accumulatedMs: 0,
+      targetDurationMs: targetMs,
+      subjectId: matched?.id || '',
+      title: params.title,
+    });
   };
 
   const activeSubject = useMemo(
@@ -896,6 +1077,7 @@ export default function App() {
     { id: 'tasks', label: 'Tasks', icon: <CheckSquare className="w-5 h-5" /> },
     { id: 'timer', label: 'Timer', icon: <TimerIcon className="w-5 h-5" /> },
     { id: 'analytics', label: 'Stats', icon: <BarChart3 className="w-5 h-5" /> },
+    { id: 'papers', label: 'Papers', icon: <FileText className="w-5 h-5" /> },
   ];
 
   const syncLabel = !isOnline
@@ -1010,7 +1192,7 @@ export default function App() {
       </header>
 
       {/* MAIN VIEWPORT */}
-      <main className="flex-1 pb-28 md:pb-14">
+      <main className="flex-1 min-h-0 pb-28 md:pb-14">
         {syncStatus.needsReconnect && !isGoogleConnected && !dismissedReconnectBanner && (
           <div className="mx-auto max-w-[1600px] px-4 sm:px-6 pt-3">
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 dark:border-amber-900/60 bg-amber-50/90 dark:bg-amber-950/35 px-3.5 py-2 text-xs text-amber-900 dark:text-amber-200">
@@ -1140,6 +1322,19 @@ export default function App() {
             dailyGoalMinutes={db.settings.dailyGoalMinutes}
           />
         )}
+
+        {activeTab === 'papers' && (
+          <PapersView
+            subjects={db.subjects}
+            pastPapers={db.pastPapers || []}
+            onCreatePaper={handleCreatePaper}
+            onUpdatePaper={handleUpdatePaper}
+            onDeletePaper={handleDeletePaper}
+            onSendQuestionToTasks={handleSendPaperQuestionToTasks}
+            onSendBatchToTasks={handleSendPaperBatchToTasks}
+            onStartRedoTimer={handleStartRedoTimer}
+          />
+        )}
       </main>
 
       {/* PERSISTENT DOCKED STUDY TIMER BAR */}
@@ -1202,7 +1397,7 @@ export default function App() {
       {/* MOBILE BOTTOM NAVIGATION BAR */}
       <nav
         aria-label="Mobile navigation"
-        className="md:hidden fixed bottom-0 left-0 right-0 z-40 grid grid-cols-4 items-center h-16 pb-safe border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 grid grid-cols-5 items-center h-16 pb-safe border-t border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md"
       >
         {navItems.map((item) => {
           const active = activeTab === item.id;
@@ -1211,14 +1406,14 @@ export default function App() {
               key={item.id}
               type="button"
               onClick={() => setActiveTab(item.id)}
-              className={`flex flex-col items-center justify-center min-h-[44px] py-1.5 transition-colors cursor-pointer ${
+              className={`flex flex-col items-center justify-center min-h-[44px] min-w-0 px-1 py-1.5 transition-colors whitespace-nowrap cursor-pointer ${
                 active
                   ? 'text-blue-600 dark:text-blue-400'
                   : 'text-slate-500 dark:text-slate-400'
               }`}
             >
               {item.icon}
-              <span className="text-[11px] font-medium tracking-tight mt-0.5">
+              <span className="text-[11px] font-medium tracking-tight mt-0.5 truncate">
                 {item.label}
               </span>
             </button>

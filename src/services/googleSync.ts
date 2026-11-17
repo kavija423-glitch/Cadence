@@ -1,6 +1,8 @@
 import type {
   CalendarBlock,
   GoogleCalendarEventOverlay,
+  PaperQuestion,
+  PastPaperRecord,
   StudyDatabase,
   Subject,
   TaskMetadata,
@@ -704,6 +706,45 @@ export function mergeStudyDatabases(local: StudyDatabase, remote: StudyDatabase)
   for (const sess of remote.study_sessions || []) sessionMap.set(sess.id, sess);
   for (const sess of local.study_sessions || []) sessionMap.set(sess.id, sess);
 
+  // Merge pastPapers by id with question-level timestamp conflict resolution
+  const paperMap = new Map<string, PastPaperRecord>();
+  for (const rp of remote.pastPapers || []) paperMap.set(rp.id, rp);
+  for (const lp of local.pastPapers || []) {
+    const rp = paperMap.get(lp.id);
+    if (!rp) {
+      paperMap.set(lp.id, lp);
+      continue;
+    }
+
+    const lTime = new Date(lp.updatedAt || 0).getTime();
+    const rTime = new Date(rp.updatedAt || 0).getTime();
+    const newerPaper = lTime >= rTime ? lp : rp;
+
+    if (newerPaper.deleted) {
+      paperMap.set(lp.id, newerPaper);
+      continue;
+    }
+
+    const qMap = new Map<string, PaperQuestion>();
+    for (const rq of rp.questions || []) qMap.set(rq.id, rq);
+    for (const lq of lp.questions || []) {
+      const rq = qMap.get(lq.id);
+      if (!rq) {
+        qMap.set(lq.id, lq);
+      } else {
+        const lqTime = new Date(lq.updatedAt || 0).getTime();
+        const rqTime = new Date(rq.updatedAt || 0).getTime();
+        qMap.set(lq.id, lqTime >= rqTime ? lq : rq);
+      }
+    }
+
+    paperMap.set(lp.id, {
+      ...newerPaper,
+      questions: Array.from(qMap.values()),
+      updatedAt: new Date(Math.max(lTime, rTime)).toISOString(),
+    });
+  }
+
   const settings = localTime >= remoteTime ? local.settings : remote.settings;
 
   return {
@@ -714,6 +755,9 @@ export function mergeStudyDatabases(local: StudyDatabase, remote: StudyDatabase)
     calendar_blocks: Array.from(blockMap.values()).filter((b) => !b.deleted),
     study_sessions: Array.from(sessionMap.values()).sort(
       (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
+    ),
+    pastPapers: Array.from(paperMap.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
     ),
     settings,
   };
@@ -1078,9 +1122,14 @@ export async function performFullGoogleSync(params: {
         ? mergeStudyDatabases(localDb, remoteDb)
         : new Date(remoteDb.modifiedTime || 0).getTime() >
           new Date(localDb.modifiedTime || 0).getTime()
-        ? remoteDb
+        ? { ...remoteDb, pastPapers: Array.isArray(remoteDb.pastPapers) ? remoteDb.pastPapers : [] }
         : mergeStudyDatabases(localDb, remoteDb);
     }
+  }
+
+  // Ensure pastPapers slice is always defined
+  if (!Array.isArray(workingDb.pastPapers)) {
+    workingDb = { ...workingDb, pastPapers: [] };
   }
 
   // Step 2: Two-way Google Tasks Sync

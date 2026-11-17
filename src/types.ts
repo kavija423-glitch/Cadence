@@ -86,6 +86,57 @@ export interface AppSettings {
   examBanners: ExamCountdown[];
 }
 
+export type ALSubjectKey = 'physics' | 'combined' | 'ict';
+
+export type PaperCategory = 'official' | 'term';
+
+export type PaperMedium = 'sinhala' | 'english';
+
+export type QuestionMasteryStatus =
+  | 'unlogged'
+  | 'mastered'
+  | 'redo'
+  | 'silly'
+  | 'unattempted';
+
+export interface QuestionSubPart {
+  id: string;
+  label: string;
+  status: QuestionMasteryStatus;
+  syllabusUnit?: string;
+  mistakeNote?: string;
+  redoneAt?: string;
+  updatedAt: string;
+}
+
+export interface PaperQuestion {
+  id: string;
+  section: string;
+  number: number;
+  label: string;
+  status: QuestionMasteryStatus;
+  syllabusUnit?: string;
+  mistakeNote?: string;
+  redoneAt?: string;
+  subParts?: QuestionSubPart[];
+  updatedAt: string;
+}
+
+export interface PastPaperRecord {
+  id: string;
+  subject: ALSubjectKey;
+  category: PaperCategory;
+  year?: number;
+  title: string;
+  medium: PaperMedium;
+  marksAwarded?: number;
+  maxMarks?: number;
+  questions: PaperQuestion[];
+  createdAt: string;
+  updatedAt: string;
+  deleted?: boolean;
+}
+
 export interface StudyDatabase {
   version: number;
   modifiedTime: string; // ISO timestamp for Drive sync conflict resolution
@@ -93,6 +144,7 @@ export interface StudyDatabase {
   tasks_metadata: Record<string, TaskMetadata>;
   calendar_blocks: CalendarBlock[];
   study_sessions: StudySession[];
+  pastPapers: PastPaperRecord[];
   settings: AppSettings;
 }
 
@@ -134,5 +186,5 @@ export interface SyncStatusInfo {
   errorMessage?: string;
 }
 
-export type MainTab = 'workspace' | 'tasks' | 'timer' | 'analytics';
+export type MainTab = 'workspace' | 'tasks' | 'timer' | 'analytics' | 'papers';
 export type TaskFilter = 'today' | 'upcoming' | 'unscheduled' | 'completed' | 'all';
