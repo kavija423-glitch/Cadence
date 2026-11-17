@@ -15,7 +15,7 @@ import { SUBJECT_COLORS } from '../utils/seedData';
 export const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/drive.appdata',
   'https://www.googleapis.com/auth/tasks',
-  'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/calendar.events',
   'https://www.googleapis.com/auth/userinfo.email',
   'https://www.googleapis.com/auth/userinfo.profile',
 ];
@@ -83,6 +83,19 @@ export class GoogleAuthInteractionRequiredError extends Error {
     this.code = code;
   }
 }
+
+export class GoogleCalendarScopeUpgradeRequiredError extends Error {
+  constructor(message?: string) {
+    super(
+      message ||
+        'Google Calendar write permission is required. Please grant Calendar event access.'
+    );
+    this.name = 'GoogleCalendarScopeUpgradeRequiredError';
+  }
+}
+
+let hasAttemptedAutoCalendarScopeUpgrade = false;
+let inFlightCalendarScopeUpgrade: Promise<string> | null = null;
 
 export function getSavedClientId(): string {
   try {
@@ -172,6 +185,7 @@ export function getStoredUserProfile(): { email: string | null; name: string | n
 }
 
 export function clearAccessToken(): void {
+  hasAttemptedAutoCalendarScopeUpgrade = false;
   const session = getStoredGoogleSession();
   const token = session?.access_token;
   try {
@@ -437,7 +451,12 @@ export async function requestInteractiveGoogleToken(
             );
             return;
           }
-          void persistTokenAndProfile(response).then(resolve).catch(reject);
+          void persistTokenAndProfile(response)
+            .then((saved) => {
+              hasAttemptedAutoCalendarScopeUpgrade = false;
+              resolve(saved);
+            })
+            .catch(reject);
         },
         error_callback: (err) => {
           if (settled) return;
@@ -566,6 +585,89 @@ async function googleFetch(
       'interaction_required',
       'Google session expired. Please reconnect.'
     );
+  }
+
+  return res;
+}
+
+function isInsufficientScope403(status: number, bodyText: string): boolean {
+  if (status !== 403) return false;
+  const lower = bodyText.toLowerCase();
+  return (
+    lower.includes('insufficient') ||
+    lower.includes('scope') ||
+    lower.includes('permission')
+  );
+}
+
+async function upgradeCalendarScopeOnce(): Promise<string> {
+  if (inFlightCalendarScopeUpgrade) {
+    return inFlightCalendarScopeUpgrade;
+  }
+  if (hasAttemptedAutoCalendarScopeUpgrade) {
+    throw new GoogleCalendarScopeUpgradeRequiredError();
+  }
+
+  hasAttemptedAutoCalendarScopeUpgrade = true;
+  const clientId = getSavedClientId();
+  const { email } = getStoredUserProfile();
+
+  if (!clientId) {
+    throw new GoogleCalendarScopeUpgradeRequiredError(
+      'Google OAuth Client ID is not configured.'
+    );
+  }
+
+  inFlightCalendarScopeUpgrade = (async () => {
+    try {
+      const upgraded = await requestInteractiveGoogleToken(clientId, {
+        hint: email || undefined,
+        prompt: 'consent',
+      });
+      return upgraded.accessToken;
+    } catch (err) {
+      throw new GoogleCalendarScopeUpgradeRequiredError(
+        err instanceof Error ? err.message : undefined
+      );
+    }
+  })().finally(() => {
+    inFlightCalendarScopeUpgrade = null;
+  });
+
+  return inFlightCalendarScopeUpgrade;
+}
+
+async function googleCalendarWriteFetch(
+  url: string,
+  token: string,
+  init: RequestInit = {},
+  allowScopeUpgradeRetry = true
+): Promise<Response> {
+  const res = await googleFetch(url, token, init, true);
+
+  if (res.status === 403) {
+    const errText = await res
+      .clone()
+      .text()
+      .catch(() => '');
+
+    if (isInsufficientScope403(res.status, errText)) {
+      if (allowScopeUpgradeRetry) {
+        const upgradedToken = await upgradeCalendarScopeOnce();
+        const retryRes = await googleFetch(url, upgradedToken, init, false);
+        if (retryRes.status === 403) {
+          const retryErrText = await retryRes
+            .clone()
+            .text()
+            .catch(() => '');
+          if (isInsufficientScope403(retryRes.status, retryErrText)) {
+            throw new GoogleCalendarScopeUpgradeRequiredError();
+          }
+        }
+        return retryRes;
+      }
+      throw new GoogleCalendarScopeUpgradeRequiredError();
+    }
   }
 
   return res;
@@ -775,7 +877,9 @@ export function mergeStudyDatabases(local: StudyDatabase, remote: StudyDatabase)
     modifiedTime: new Date().toISOString(),
     subjects: Array.from(subjectMap.values()),
     tasks_metadata: tasksMap,
-    calendar_blocks: Array.from(blockMap.values()).filter((b) => !b.deleted),
+    calendar_blocks: Array.from(blockMap.values()).filter(
+      (b) => !b.deleted || Boolean(b.googleEventId)
+    ),
     study_sessions: Array.from(sessionMap.values()).sort(
       (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
     ),
@@ -1019,15 +1123,137 @@ async function syncGoogleTasksBidirectional(
 }
 
 // ==========================================
-// 3. GOOGLE CALENDAR READ-ONLY OVERLAY
+// 3. GOOGLE CALENDAR TWO-WAY SYNC
 // ==========================================
 
 interface GoogleCalendarEventRaw {
   id: string;
   summary?: string;
+  updated?: string;
   htmlLink?: string;
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
+}
+
+function formatLocalRfc3339(dt: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const offsetMin = -dt.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? '+' : '-';
+  const absMin = Math.abs(offsetMin);
+  const offH = pad(Math.floor(absMin / 60));
+  const offM = pad(absMin % 60);
+  return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(
+    dt.getHours()
+  )}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}${sign}${offH}:${offM}`;
+}
+
+function buildGoogleCalendarEventBody(block: CalendarBlock, subjectName?: string) {
+  const [y, m, d] = block.date.split('-').map(Number);
+  const startLocal = new Date(y, (m || 1) - 1, d || 1, 0, block.startMinutes, 0, 0);
+  const endLocal = new Date(
+    startLocal.getTime() + Math.max(15, block.durationMinutes) * 60_000
+  );
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const descriptionParts = [
+    subjectName ? `Subject: ${subjectName}` : null,
+    'Scheduled in Cadence',
+  ].filter(Boolean);
+
+  return {
+    summary: block.title,
+    description: descriptionParts.join('\n'),
+    start: {
+      dateTime: formatLocalRfc3339(startLocal),
+      timeZone,
+    },
+    end: {
+      dateTime: formatLocalRfc3339(endLocal),
+      timeZone,
+    },
+    extendedProperties: {
+      private: {
+        cadenceBlockId: block.id,
+        ...(block.taskId ? { cadenceTaskId: block.taskId } : {}),
+      },
+    },
+  };
+}
+
+export async function createGoogleCalendarEventForBlock(
+  token: string,
+  block: CalendarBlock,
+  subjectName?: string
+): Promise<string> {
+  const res = await googleCalendarWriteFetch(
+    'https://www.googleapis.com/calendar/v3/calendars/primary/events',
+    token,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildGoogleCalendarEventBody(block, subjectName)),
+    }
+  );
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Calendar event create failed (${res.status}): ${errText}`);
+  }
+  const created = (await res.json()) as { id: string };
+  return created.id;
+}
+
+export async function updateGoogleCalendarEventForBlock(
+  token: string,
+  block: CalendarBlock,
+  subjectName?: string
+): Promise<string> {
+  if (!block.googleEventId) {
+    return createGoogleCalendarEventForBlock(token, block, subjectName);
+  }
+
+  const res = await googleCalendarWriteFetch(
+    `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(
+      block.googleEventId
+    )}`,
+    token,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildGoogleCalendarEventBody(block, subjectName)),
+    }
+  );
+
+  if (res.status === 404 || res.status === 410) {
+    return createGoogleCalendarEventForBlock(token, block, subjectName);
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Calendar event update failed (${res.status}): ${errText}`);
+  }
+
+  return block.googleEventId;
+}
+
+export async function deleteGoogleCalendarEventById(
+  token: string,
+  googleEventId: string
+): Promise<void> {
+  const res = await googleCalendarWriteFetch(
+    `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(
+      googleEventId
+    )}`,
+    token,
+    { method: 'DELETE' }
+  );
+
+  if (res.status === 404 || res.status === 410) {
+    return;
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Calendar event delete failed (${res.status}): ${errText}`);
+  }
 }
 
 export async function fetchGoogleCalendarOverlay(
@@ -1085,6 +1311,7 @@ export async function fetchGoogleCalendarOverlay(
         isAllDay: false,
         calendarName: data.summary,
         htmlLink: ev.htmlLink,
+        updated: ev.updated,
       });
     } else if (ev.start?.date) {
       overlays.push({
@@ -1096,11 +1323,81 @@ export async function fetchGoogleCalendarOverlay(
         isAllDay: true,
         calendarName: data.summary,
         htmlLink: ev.htmlLink,
+        updated: ev.updated,
       });
     }
   }
 
   return overlays;
+}
+
+async function syncGoogleCalendarBlocksBidirectional(
+  token: string,
+  db: StudyDatabase,
+  weekOverlays: GoogleCalendarEventOverlay[]
+): Promise<{ db: StudyDatabase; didMutateRemote: boolean }> {
+  const subjectNameById = new Map(db.subjects.map((s) => [s.id, s.name]));
+  const overlayById = new Map(weekOverlays.map((ev) => [ev.id, ev]));
+  const nextBlocks: CalendarBlock[] = [];
+  let didMutateRemote = false;
+
+  for (const block of db.calendar_blocks) {
+    if (block.deleted) {
+      if (block.googleEventId) {
+        await deleteGoogleCalendarEventById(token, block.googleEventId);
+        didMutateRemote = true;
+      }
+      continue;
+    }
+
+    const subjName = subjectNameById.get(block.subjectId);
+    if (!block.googleEventId) {
+      const createdId = await createGoogleCalendarEventForBlock(token, block, subjName);
+      didMutateRemote = true;
+      nextBlocks.push({
+        ...block,
+        googleEventId: createdId,
+      });
+      continue;
+    }
+
+    const remoteEv = overlayById.get(block.googleEventId);
+    if (remoteEv && remoteEv.updated && !remoteEv.isAllDay) {
+      const remoteMs = new Date(remoteEv.updated).getTime();
+      const localMs = new Date(block.updatedAt || 0).getTime();
+
+      if (remoteMs > localMs + 1500) {
+        nextBlocks.push({
+          ...block,
+          title: remoteEv.summary || block.title,
+          date: remoteEv.date,
+          startMinutes: remoteEv.startMinutes,
+          durationMinutes: remoteEv.durationMinutes,
+          updatedAt: remoteEv.updated,
+        });
+        continue;
+      }
+
+      if (localMs > remoteMs + 1500) {
+        const returnedId = await updateGoogleCalendarEventForBlock(token, block, subjName);
+        didMutateRemote = true;
+        nextBlocks.push(
+          returnedId !== block.googleEventId ? { ...block, googleEventId: returnedId } : block
+        );
+        continue;
+      }
+    }
+
+    nextBlocks.push(block);
+  }
+
+  return {
+    db: {
+      ...db,
+      calendar_blocks: nextBlocks,
+    },
+    didMutateRemote,
+  };
 }
 
 // ==========================================
@@ -1173,15 +1470,25 @@ export async function performFullGoogleSync(params: {
   // Step 2: Two-way Google Tasks Sync
   workingDb = await syncGoogleTasksBidirectional(token, workingDb);
 
-  // Step 3: Push consolidated study_sync.json to Drive AppData
+  // Step 3: Two-way Google Calendar Sync for study time blocks
+  let calendarEvents = await fetchGoogleCalendarOverlay(token, weekStart, weekEnd);
+  const calendarSyncResult = await syncGoogleCalendarBlocksBidirectional(
+    token,
+    workingDb,
+    calendarEvents
+  );
+  workingDb = calendarSyncResult.db;
+
+  if (calendarSyncResult.didMutateRemote) {
+    calendarEvents = await fetchGoogleCalendarOverlay(token, weekStart, weekEnd);
+  }
+
+  // Step 4: Push consolidated study_sync.json to Drive AppData
   const savedMeta = await uploadDriveSyncFile(
     token,
     workingDb,
     remoteMeta?.id || knownRemoteFileId
   );
-
-  // Step 4: Pull read-only Google Calendar overlay for active week
-  const calendarEvents = await fetchGoogleCalendarOverlay(token, weekStart, weekEnd);
 
   return {
     mergedDb: workingDb,

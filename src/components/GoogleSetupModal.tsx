@@ -177,7 +177,7 @@ export const GoogleSetupModal: React.FC<GoogleSetupModalProps> = ({
                   Google Cloud Sync (Zero Backend)
                 </h3>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  Scopes: Drive AppData (<code className="font-mono">study_sync.json</code>), Google Tasks (2-way), Calendar (read-only)
+                  Scopes: Drive AppData (<code className="font-mono">study_sync.json</code>), Google Tasks (2-way), Calendar (2-way events)
                 </p>
               </div>
               {isConnected ? (

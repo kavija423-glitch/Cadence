@@ -44,6 +44,7 @@ export interface TaskMetadata {
 export interface CalendarBlock {
   id: string;
   taskId?: string;
+  googleEventId?: string;
   subjectId: string;
   title: string;
   date: string; // YYYY-MM-DD
@@ -179,6 +180,7 @@ export interface GoogleCalendarEventOverlay {
   isAllDay: boolean;
   calendarName?: string;
   htmlLink?: string;
+  updated?: string;
 }
 
 export interface ActiveTimerSnapshot {
@@ -204,6 +206,7 @@ export interface SyncStatusInfo {
   userEmail: string | null;
   userName?: string | null;
   needsReconnect?: boolean;
+  needsCalendarScopeUpgrade?: boolean;
   reconnectReason?: string;
   errorMessage?: string;
 }

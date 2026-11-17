@@ -108,6 +108,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
     previewDuration: number;
   } | null>(null);
   const [selectedBlock, setSelectedBlock] = useState<CalendarBlock | null>(null);
+  const [editingBlockTitle, setEditingBlockTitle] = useState('');
   const [creatingSlot, setCreatingSlot] = useState<{
     date: string;
     startMinutes: number;
@@ -180,6 +181,20 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
     () => blocks.filter((b) => !b.deleted),
     [blocks]
   );
+
+  const syncedEventIds = useMemo(
+    () =>
+      new Set(
+        activeBlocks
+          .map((b) => b.googleEventId)
+          .filter((id): id is string => Boolean(id))
+      ),
+    [activeBlocks]
+  );
+
+  useEffect(() => {
+    setEditingBlockTitle(selectedBlock?.title || '');
+  }, [selectedBlock?.id, selectedBlock?.title]);
 
   // Current time indicator position
   const [nowMinutes, setNowMinutes] = useState(() => {
@@ -355,7 +370,9 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
 
   const renderDayColumnContent = (dateKey: string) => {
     const dayBlocks = activeBlocks.filter((b) => b.date === dateKey);
-    const dayGcal = googleEvents.filter((ev) => ev.date === dateKey);
+    const dayGcal = googleEvents.filter(
+      (ev) => ev.date === dateKey && !syncedEventIds.has(ev.id)
+    );
     const isToday = dateKey === todayKey;
 
     return (
@@ -382,7 +399,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
           </div>
         )}
 
-        {/* Read-only Google Calendar Event Overlay */}
+        {/* External Google Calendar Event Overlay */}
         {dayGcal.map((ev) => {
           const clampedStart = Math.max(START_HOUR * 60, ev.startMinutes);
           const clampedEnd = Math.min(END_HOUR * 60, ev.startMinutes + ev.durationMinutes);
@@ -394,7 +411,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
             <div
               key={`gcal-${ev.id}`}
               style={{ top: `${topPx}px`, height: `${heightPx}px` }}
-              title={`${ev.summary} (Google Calendar · Read-only)`}
+              title={`${ev.summary} (Google Calendar)`}
               className="absolute left-1 right-1 z-10 rounded-lg border border-slate-200 dark:border-slate-700/80 bg-slate-100/90 dark:bg-slate-800/70 gcal-overlay-pattern px-2 py-1 overflow-hidden pointer-events-none"
             >
               <div className="flex items-center gap-1 text-[11px] font-medium text-slate-500 dark:text-slate-400 truncate">
@@ -933,10 +950,32 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/50 backdrop-blur-xs p-0 sm:p-4">
           <div className="w-full max-w-sm rounded-t-3xl sm:rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4 shadow-2xl">
             <div className="flex items-start justify-between gap-3">
-              <div>
-                <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-                  {selectedBlock.title}
-                </h3>
+              <div className="flex-1 min-w-0">
+                <input
+                  type="text"
+                  value={editingBlockTitle}
+                  onChange={(e) => setEditingBlockTitle(e.target.value)}
+                  onBlur={() => {
+                    const trimmed = editingBlockTitle.trim();
+                    if (trimmed && trimmed !== selectedBlock.title) {
+                      onUpdateBlock(selectedBlock.id, { title: trimmed });
+                      setSelectedBlock({ ...selectedBlock, title: trimmed });
+                    } else {
+                      setEditingBlockTitle(selectedBlock.title);
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      (e.currentTarget as HTMLInputElement).blur();
+                    } else if (e.key === 'Escape') {
+                      setEditingBlockTitle(selectedBlock.title);
+                      (e.currentTarget as HTMLInputElement).blur();
+                    }
+                  }}
+                  aria-label="Study block title"
+                  className="w-full rounded-lg border border-transparent hover:border-slate-200 dark:hover:border-slate-700 focus:border-blue-500 focus:bg-slate-50 dark:focus:bg-slate-950 bg-transparent px-1.5 py-0.5 -ml-1.5 text-base font-semibold text-slate-900 dark:text-slate-100 outline-none transition-colors"
+                />
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 font-mono tabular-nums">
                   {formatShortDate(selectedBlock.date)} ·{' '}
                   {formatMinutesAsClock(selectedBlock.startMinutes)}–
@@ -949,7 +988,7 @@ export const TimeBlockingCalendar: React.FC<TimeBlockingCalendarProps> = ({
               <button
                 type="button"
                 onClick={() => setSelectedBlock(null)}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 shrink-0"
               >
                 <X className="w-4 h-4" />
               </button>

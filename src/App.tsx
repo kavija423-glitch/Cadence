@@ -41,7 +41,10 @@ import { createEmptyDatabase } from './utils/seedData';
 import { playCompletionChime } from './utils/sound';
 import {
   GoogleAuthInteractionRequiredError,
+  GoogleCalendarScopeUpgradeRequiredError,
   clearAccessToken,
+  createGoogleCalendarEventForBlock,
+  deleteGoogleCalendarEventById,
   ensureValidGoogleToken,
   fetchGoogleCalendarOverlay,
   fetchGoogleUserProfile,
@@ -55,6 +58,7 @@ import {
   requestInteractiveGoogleToken,
   saveClientId,
   silentRefreshGoogleToken,
+  updateGoogleCalendarEventForBlock,
 } from './services/googleSync';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
@@ -154,6 +158,7 @@ export default function App() {
   const [clientId, setClientId] = useState<string>(() => getSavedClientId());
   const [isGoogleConnected, setIsGoogleConnected] = useState<boolean>(() => hasValidAccessToken());
   const [dismissedReconnectBanner, setDismissedReconnectBanner] = useState(false);
+  const [dismissedScopeUpgradeBanner, setDismissedScopeUpgradeBanner] = useState(false);
   const [googleEvents, setGoogleEvents] = useState<GoogleCalendarEventOverlay[]>([]);
   const [syncStatus, setSyncStatus] = useState<SyncStatusInfo>(() => {
     const profile = getStoredUserProfile();
@@ -165,6 +170,7 @@ export default function App() {
       userEmail: profile.email,
       userName: profile.name,
       needsReconnect: false,
+      needsCalendarScopeUpgrade: false,
     };
   });
 
@@ -246,10 +252,21 @@ export default function App() {
           userEmail: profile.email || prev.userEmail,
           userName: profile.name || prev.userName,
           needsReconnect: false,
+          needsCalendarScopeUpgrade: false,
           reconnectReason: undefined,
           errorMessage: undefined,
         }));
       } catch (err) {
+        if (err instanceof GoogleCalendarScopeUpgradeRequiredError) {
+          setDismissedScopeUpgradeBanner(false);
+          setSyncStatus((prev) => ({
+            ...prev,
+            state: 'local',
+            needsCalendarScopeUpgrade: true,
+            errorMessage: undefined,
+          }));
+          return;
+        }
         if (err instanceof GoogleAuthInteractionRequiredError) {
           setIsGoogleConnected(false);
           setDismissedReconnectBanner(false);
@@ -272,6 +289,46 @@ export default function App() {
     },
     [weekStart]
   );
+
+  const runCalendarMutation = useCallback(async (fn: (token: string) => Promise<void>) => {
+    if (!navigator.onLine) return;
+    const canAttempt =
+      hasValidAccessToken() ||
+      (isGoogleConnectedRef.current &&
+        !syncStatusRef.current.needsReconnect &&
+        !!getStoredUserProfile().email);
+    if (!canAttempt) return;
+
+    try {
+      let token = getAccessToken();
+      if (!token) {
+        token = await ensureValidGoogleToken();
+      }
+      if (!token) return;
+      await fn(token);
+    } catch (err) {
+      if (err instanceof GoogleCalendarScopeUpgradeRequiredError) {
+        setDismissedScopeUpgradeBanner(false);
+        setSyncStatus((prev) => ({
+          ...prev,
+          needsCalendarScopeUpgrade: true,
+          errorMessage: undefined,
+        }));
+        return;
+      }
+      if (err instanceof GoogleAuthInteractionRequiredError) {
+        setIsGoogleConnected(false);
+        setDismissedReconnectBanner(false);
+        setSyncStatus((prev) => ({
+          ...prev,
+          state: 'local',
+          needsReconnect: true,
+          reconnectReason: err.code,
+          errorMessage: undefined,
+        }));
+      }
+    }
+  }, []);
 
   // Helper to update DB and schedule 10-second debounced Drive sync
   const mutateDb = useCallback(
@@ -453,11 +510,50 @@ export default function App() {
 
       setIsGoogleConnected(true);
       setDismissedReconnectBanner(false);
+      setDismissedScopeUpgradeBanner(false);
       setSyncStatus((prev) => ({
         ...prev,
         userEmail: result.email || prev.userEmail,
         userName: result.name || prev.userName,
         needsReconnect: false,
+        needsCalendarScopeUpgrade: false,
+        reconnectReason: undefined,
+        errorMessage: undefined,
+      }));
+      await runSync(result.accessToken);
+    } catch (err) {
+      setSyncStatus((prev) => ({
+        ...prev,
+        state: 'error',
+        errorMessage: err instanceof Error ? err.message : 'Authorization failed.',
+      }));
+    }
+  };
+
+  const handleGrantCalendarScopeUpgrade = async () => {
+    const resolvedClientId = (clientId || getSavedClientId()).trim();
+    if (!resolvedClientId) {
+      setShowSetupModal(true);
+      return;
+    }
+
+    setSyncStatus((prev) => ({ ...prev, state: 'connecting', errorMessage: undefined }));
+    try {
+      const savedProfile = getStoredUserProfile();
+      const result = await requestInteractiveGoogleToken(resolvedClientId, {
+        hint: syncStatusRef.current.userEmail || savedProfile.email || undefined,
+        prompt: 'consent',
+      });
+
+      setIsGoogleConnected(true);
+      setDismissedReconnectBanner(false);
+      setDismissedScopeUpgradeBanner(false);
+      setSyncStatus((prev) => ({
+        ...prev,
+        userEmail: result.email || prev.userEmail,
+        userName: result.name || prev.userName,
+        needsReconnect: false,
+        needsCalendarScopeUpgrade: false,
         reconnectReason: undefined,
         errorMessage: undefined,
       }));
@@ -475,6 +571,7 @@ export default function App() {
     clearAccessToken();
     setIsGoogleConnected(false);
     setDismissedReconnectBanner(false);
+    setDismissedScopeUpgradeBanner(false);
     setGoogleEvents([]);
     setSyncStatus({
       state: 'local',
@@ -484,6 +581,7 @@ export default function App() {
       userEmail: null,
       userName: null,
       needsReconnect: false,
+      needsCalendarScopeUpgrade: false,
       reconnectReason: undefined,
     });
   };
@@ -768,11 +866,17 @@ export default function App() {
       !!targetRepeat &&
       !currentTask.nextOccurrenceSpawned;
 
+    const hasCalendarFieldChange =
+      patch.title !== undefined || patch.subjectId !== undefined;
+    const linkedBlocks = hasCalendarFieldChange
+      ? dbRef.current.calendar_blocks.filter((b) => !b.deleted && b.taskId === taskId)
+      : [];
+    const nowIso = new Date().toISOString();
+
     mutateDb((prev) => {
       const existing = prev.tasks_metadata[taskId];
       if (!existing) return prev;
 
-      const nowIso = new Date().toISOString();
       const effectiveRepeat = normalizeRepeatRule(
         hasRepeatPatch ? patch.repeat : existing.repeat
       );
@@ -814,14 +918,63 @@ export default function App() {
         };
       }
 
+      const nextBlocks = hasCalendarFieldChange
+        ? prev.calendar_blocks.map((b) =>
+            !b.deleted && b.taskId === taskId
+              ? {
+                  ...b,
+                  ...(patch.title !== undefined ? { title: patch.title } : {}),
+                  ...(patch.subjectId !== undefined ? { subjectId: patch.subjectId } : {}),
+                  updatedAt: nowIso,
+                }
+              : b
+          )
+        : prev.calendar_blocks;
+
       return {
         ...prev,
         tasks_metadata: nextTasks,
+        calendar_blocks: nextBlocks,
       };
     }, willRollForward);
+
+    if (hasCalendarFieldChange && linkedBlocks.length > 0) {
+      for (const blk of linkedBlocks) {
+        if (!blk.googleEventId) continue;
+        const updatedBlk: CalendarBlock = {
+          ...blk,
+          ...(patch.title !== undefined ? { title: patch.title } : {}),
+          ...(patch.subjectId !== undefined ? { subjectId: patch.subjectId } : {}),
+          updatedAt: nowIso,
+        };
+        const subjectName = dbRef.current.subjects.find(
+          (s) => s.id === updatedBlk.subjectId
+        )?.name;
+        void runCalendarMutation(async (token) => {
+          const returnedId = await updateGoogleCalendarEventForBlock(
+            token,
+            updatedBlk,
+            subjectName
+          );
+          if (returnedId && returnedId !== updatedBlk.googleEventId) {
+            mutateDb((prev) => ({
+              ...prev,
+              calendar_blocks: prev.calendar_blocks.map((b) =>
+                b.id === updatedBlk.id ? { ...b, googleEventId: returnedId } : b
+              ),
+            }));
+          }
+        });
+      }
+    }
   };
 
   const handleDeleteTask = (taskId: string) => {
+    const linkedBlocks = dbRef.current.calendar_blocks.filter(
+      (b) => !b.deleted && b.taskId === taskId
+    );
+    const nowIso = new Date().toISOString();
+
     mutateDb((prev) => {
       const existing = prev.tasks_metadata[taskId];
       if (!existing) return prev;
@@ -831,16 +984,38 @@ export default function App() {
         nextTasks[taskId] = {
           ...existing,
           deleted: true,
-          updatedAt: new Date().toISOString(),
+          updatedAt: nowIso,
         };
       } else {
         delete nextTasks[taskId];
       }
+
+      const nextBlocks = prev.calendar_blocks
+        .filter((b) => !(b.taskId === taskId && !b.googleEventId))
+        .map((b) =>
+          b.taskId === taskId && b.googleEventId
+            ? { ...b, deleted: true, updatedAt: nowIso }
+            : b
+        );
+
       return {
         ...prev,
         tasks_metadata: nextTasks,
+        calendar_blocks: nextBlocks,
       };
     });
+
+    for (const blk of linkedBlocks) {
+      if (!blk.googleEventId) continue;
+      const eventId = blk.googleEventId;
+      void runCalendarMutation(async (token) => {
+        await deleteGoogleCalendarEventById(token, eventId);
+        mutateDb((prev) => ({
+          ...prev,
+          calendar_blocks: prev.calendar_blocks.filter((b) => b.id !== blk.id),
+        }));
+      });
+    }
   };
 
   // Calendar Block CRUD
@@ -854,18 +1029,92 @@ export default function App() {
       ...prev,
       calendar_blocks: [...prev.calendar_blocks, newBlock],
     }));
+
+    const subjectName = dbRef.current.subjects.find(
+      (s) => s.id === newBlock.subjectId
+    )?.name;
+    void runCalendarMutation(async (token) => {
+      const googleEventId = await createGoogleCalendarEventForBlock(
+        token,
+        newBlock,
+        subjectName
+      );
+      mutateDb((prev) => ({
+        ...prev,
+        calendar_blocks: prev.calendar_blocks.map((b) =>
+          b.id === newBlock.id ? { ...b, googleEventId } : b
+        ),
+      }));
+    });
   };
 
   const handleUpdateBlock = (blockId: string, patch: Partial<CalendarBlock>) => {
+    const existingBlock = dbRef.current.calendar_blocks.find((b) => b.id === blockId);
+    const nowIso = new Date().toISOString();
+
     mutateDb((prev) => ({
       ...prev,
       calendar_blocks: prev.calendar_blocks.map((b) =>
-        b.id === blockId ? { ...b, ...patch, updatedAt: new Date().toISOString() } : b
+        b.id === blockId ? { ...b, ...patch, updatedAt: nowIso } : b
       ),
     }));
+
+    const shouldSyncCalendar =
+      patch.title !== undefined ||
+      patch.date !== undefined ||
+      patch.startMinutes !== undefined ||
+      patch.durationMinutes !== undefined ||
+      patch.subjectId !== undefined;
+
+    if (existingBlock && !existingBlock.deleted && shouldSyncCalendar) {
+      const updatedBlock: CalendarBlock = {
+        ...existingBlock,
+        ...patch,
+        updatedAt: nowIso,
+      };
+      const subjectName = dbRef.current.subjects.find(
+        (s) => s.id === updatedBlock.subjectId
+      )?.name;
+      void runCalendarMutation(async (token) => {
+        const returnedEventId = await updateGoogleCalendarEventForBlock(
+          token,
+          updatedBlock,
+          subjectName
+        );
+        if (returnedEventId && returnedEventId !== updatedBlock.googleEventId) {
+          mutateDb((prev) => ({
+            ...prev,
+            calendar_blocks: prev.calendar_blocks.map((b) =>
+              b.id === blockId ? { ...b, googleEventId: returnedEventId } : b
+            ),
+          }));
+        }
+      });
+    }
   };
 
   const handleDeleteBlock = (blockId: string) => {
+    const targetBlock = dbRef.current.calendar_blocks.find((b) => b.id === blockId);
+    const nowIso = new Date().toISOString();
+
+    if (targetBlock?.googleEventId) {
+      mutateDb((prev) => ({
+        ...prev,
+        calendar_blocks: prev.calendar_blocks.map((b) =>
+          b.id === blockId ? { ...b, deleted: true, updatedAt: nowIso } : b
+        ),
+      }));
+      const eventId = targetBlock.googleEventId;
+      void runCalendarMutation(async (token) => {
+        await deleteGoogleCalendarEventById(token, eventId);
+        mutateDb((prev) => ({
+          ...prev,
+          calendar_blocks: prev.calendar_blocks.filter((b) => b.id !== blockId),
+        }));
+      });
+      return;
+    }
+
     mutateDb((prev) => ({
       ...prev,
       calendar_blocks: prev.calendar_blocks.filter((b) => b.id !== blockId),
@@ -1368,6 +1617,36 @@ export default function App() {
                   onClick={() => setDismissedReconnectBanner(true)}
                   className="p-1 rounded-md text-amber-700/70 hover:text-amber-900 dark:text-amber-300/70 dark:hover:text-amber-100 cursor-pointer"
                   aria-label="Dismiss reconnect notice"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {syncStatus.needsCalendarScopeUpgrade && !dismissedScopeUpgradeBanner && (
+          <div className="mx-auto max-w-[1600px] px-4 sm:px-6 pt-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-blue-200 dark:border-blue-900/60 bg-blue-50/90 dark:bg-blue-950/35 px-3.5 py-2 text-xs text-blue-900 dark:text-blue-200">
+              <div className="flex items-center gap-2 min-w-0">
+                <AlertCircle className="w-4 h-4 shrink-0 text-blue-600 dark:text-blue-400" />
+                <span className="truncate">
+                  Google Calendar write permission is required to sync new, updated, and deleted study blocks to your calendar.
+                </span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0 ml-auto">
+                <button
+                  type="button"
+                  onClick={() => void handleGrantCalendarScopeUpgrade()}
+                  disabled={syncStatus.state === 'connecting'}
+                  className="rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-60 px-2.5 py-1 text-xs font-medium text-white transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  {syncStatus.state === 'connecting' ? 'Authorizing...' : 'Grant Calendar Access'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDismissedScopeUpgradeBanner(true)}
+                  className="p-1 rounded-md text-blue-700/70 hover:text-blue-900 dark:text-blue-300/70 dark:hover:text-blue-100 cursor-pointer"
+                  aria-label="Dismiss Calendar permission notice"
                 >
                   <X className="w-3.5 h-3.5" />
                 </button>
